@@ -18,9 +18,9 @@ Phased plan. Each task is sized to be implemented in one focused session (human 
 
 | ID | Task | Done when |
 |---|---|---|
-| P0-1 | Cargo workspace with crates from `collector-dotnet.md` §7 (empty stubs), `rustfmt`, `clippy`, CI (build + test on Linux and Windows) | `cargo test` passes in CI on both OSes |
-| P0-2 | `docs/` with these documents; `AGENTS.md` (or `CLAUDE.md`) pointing AI assistants to them and listing ground rules | Docs in repo; agent file present |
-| P0-3 | `samples/` .NET 10 apps: `LeakyOrderService` (static event leak — reference scenario), `SteadyAllocator`, `LohChurn`, `NativeLeak` | Each runs with `dotnet run`; leak visible in `dotnet-counters` |
+| ✅ P0-1 | Cargo workspace with crates from `collector-dotnet.md` §7 (empty stubs), `rustfmt`, `clippy`, CI (build + test on Linux and Windows) | `cargo test` passes in CI on both OSes |
+| ✅ P0-2 | `docs/` with these documents; `AGENTS.md` (or `CLAUDE.md`) pointing AI assistants to them and listing ground rules | Docs in repo; agent file present |
+| ✅ P0-3 | `samples/` .NET 10 apps: `LeakyOrderService` (static event leak — reference scenario), `SteadyAllocator`, `LohChurn`, `NativeLeak` | Each runs with `dotnet run`; leak visible in `dotnet-counters` |
 | P0-4 | `wolf-contract`: types Point, Event, Capability, Command, CommandResult, ArtifactRef, TargetId; serde; schema version constant | Unit tests for (de)serialization |
 
 ## Phase 1 — "Watch": live telemetry

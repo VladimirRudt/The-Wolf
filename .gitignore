@@ -2,3 +2,5 @@
 *.briefcase
 *.nettrace
 !testdata/**/*.nettrace
+bin/
+obj/

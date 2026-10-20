@@ -23,7 +23,17 @@ Mr. Wolf is an AI-targeted .NET memory profiler written in Rust. Collectors atta
 
 ## Tech stack
 
-Rust (tokio, memmap2, bytemuck/zerocopy, duckdb). Cargo workspace with crates listed in `docs/collector-dotnet.md` §7. Sample apps in `samples/` target .NET 8.
+Rust (tokio, memmap2, bytemuck/zerocopy, duckdb). Cargo workspace with crates listed in `docs/collector-dotnet.md` §7. Sample apps in `samples/` target .NET 10.
+
+## Layout
+
+- `Cargo.toml` — virtual workspace: shared package metadata, lints, and internal crate paths (`[workspace.dependencies]`). Crates inherit with `x.workspace = true`.
+- `crates/<name>/` — one crate per component. Libraries keep logic; binaries (`wolf-host`, later the CLI and MCP server) stay thin.
+- Add a crate only when a roadmap task needs it (planned: analysis, rules, MCP, CLI). Add new dependencies to the crate that uses them, not ahead of time.
+- `samples/` — .NET 10 test apps (`Samples.slnx`); see `samples/README.md` for each app's expected memory shape.
+- `testdata/` — recorded `.nettrace` streams and other golden files (created with the first parser).
+- `.github/workflows/ci.yml` — fmt, clippy, build, test on Linux and Windows.
+- Task status lives in `docs/roadmap.md` (✅ prefix on the task ID).
 
 ## Commands
 

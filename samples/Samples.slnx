@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="LeakyOrderService/LeakyOrderService.csproj" />
+  <Project Path="LohChurn/LohChurn.csproj" />
+  <Project Path="NativeLeak/NativeLeak.csproj" />
+  <Project Path="SteadyAllocator/SteadyAllocator.csproj" />
+</Solution>
