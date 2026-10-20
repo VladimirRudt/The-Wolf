@@ -1,0 +1,29 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "GPL-3.0-only"
+repository = "https://github.com/VladimirRudt/The-Wolf"
+
+[workspace.dependencies]
+wolf-contract = { path = "crates/wolf-contract" }
+wolf-ipc = { path = "crates/wolf-ipc" }
+wolf-nettrace = { path = "crates/wolf-nettrace" }
+wolf-dotnet = { path = "crates/wolf-dotnet" }
+wolf-process = { path = "crates/wolf-process" }
+wolf-briefcase = { path = "crates/wolf-briefcase" }
+wolf-storage = { path = "crates/wolf-storage" }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+dbg_macro = "warn"
+todo = "warn"
+unwrap_used = "warn"

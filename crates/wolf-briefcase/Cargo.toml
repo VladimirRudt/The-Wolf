@@ -1,0 +1,14 @@
+[package]
+name = "wolf-briefcase"
+description = "Writer and memory-mapped reader for .briefcase heap snapshot files."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true
