@@ -60,40 +60,48 @@ This document is the source of truth for the overall design. Implementation task
 
 ## 3. Collector contract (all collectors)
 
-Every collector implements the same contract so the rest of the system is collector-agnostic.
+Every collector implements the same contract so the rest of the system is collector-agnostic. Implemented in `crates/wolf-contract` (schema version constant `SCHEMA_VERSION`).
+
+**The contract is generic.** It defines concepts (target, series, point, event, command, artifact), never collector-specific names. Metric names, event kinds, command names (e.g. `heap_snapshot`), command parameters and artifact kinds are strings owned and documented by each collector (for .NET: `collector-dotnet.md` §4, §6). Adding a collector never changes the contract.
 
 ### 3.1 Target identity
-`target_id` format: `pid:<pid>@<host>` (e.g. `pid:4812@srv-a`). Collectors also report target metadata: runtime/version, command line, start time.
+`target_id` format: `pid:<pid>.<start>@<host>` (e.g. `pid:4812.1760843645@srv-a`), where `<start>` is the process start time in Unix seconds, so a reused PID is a different target. Every collector takes the start time from the OS, so all collectors produce the same id for the same process. Collectors also report target metadata: runtime/version, command line.
 
-### 3.2 Time-series point — a reading of a quantity
-Something that always has a value; we sample it.
+### 3.2 Time series — a reading of a quantity
+Something that always has a value; we sample it. Strings are sent **once per series** in a descriptor; each point is three numbers (24 bytes, no allocations).
 ```text
-{ ts_utc_ns, source: "dotnet", target: "pid:4812@srv-a",
-  metric: "dotnet.gc.heap.size", labels: { generation: "gen2" },
-  value: 157286400, unit: "bytes" }
+series: { id, target: "pid:4812.1760843645@srv-a",
+          metric: "dotnet.gc.heap.size", labels: { generation: "gen2" }, unit: "bytes" }
+point:  { series: <id>, ts_utc_ns, value: 157286400 }
 ```
+The series `id` is a stable 64-bit hash (FNV-1a) of target + metric + labels, so collectors compute it without coordination and it never changes between releases. The unit is not part of the identity. The source collector is implied by the metric prefix (`dotnet.`, `process.`, `wolf.`).
+
+**Label values must come from a small fixed set** (e.g. `generation`: gen0/gen1/gen2/loh/poh). Never use type names, stacks, ids, paths or other unbounded values as labels: each value creates a new series, and a series with only a few points is pure overhead. Such data goes into events or analysis tables. Expected size: ~30 series per target; new targets appear only when a process starts.
 
 ### 3.3 Event — something that happened
 Discrete occurrence with structured details; nothing exists between events.
 ```text
-{ ts_utc_ns, source: "dotnet", target: "pid:4812@srv-a",
+{ ts_utc_ns, target: "pid:4812.1760843645@srv-a",
   kind: "dotnet.gc", data: { generation: 2, reason: "AllocSmall", type: "background",
                              pause_ms: 7.9, compacting: false } }
 ```
 Rule of thumb: "what is it now?" → time series. "When did it happen and what were the details?" → event. Collectors send **raw events**; derived series (GCs per minute, pause p95) are computed by queries.
 
-### 3.4 Capabilities
+### 3.4 Collector info
+Who the collector is and which commands it accepts. Rules and MCP tools discover commands here.
 ```text
-{ source: "dotnet", capabilities: ["telemetry", "heap_snapshot", "alloc_sampling"],
-  limits: { heap_snapshot: { min_interval_s: 300 } } }
+{ name: "dotnet", commands: ["heap_snapshot"] }
 ```
 
 ### 3.5 Commands and results
 ```text
-→ { command_id, command: "heap_snapshot", target, reason: "rule:gen2-growth", not_before?: ts }
-← { command_id, status: "done" | "rejected" | "failed", artifact?: "<file>", details }
+→ { command_id, target, name: "heap_snapshot", reason: "rule:gen2-growth", params?: { … } }
+← { command_id, status: "done" | "rejected" | "failed", artifact?: { kind: "briefcase", path }, message? }
 ```
-Collectors enforce their own safety limits (last line of defense) regardless of who sends the command.
+- A command means "run now". Scheduling (e.g. two snapshots 5 min apart) is the host's job, not the collector's.
+- `reason` is recorded in the artifact's metadata. `message` explains a rejection or failure (unknown command, safety limit).
+- Measurements (object counts, pause) go into the collector's events (e.g. `dotnet.snapshot.finished`), not into the result.
+- Collectors enforce their own safety limits (last line of defense) regardless of who sends the command.
 
 ### 3.6 Artifacts
 Self-contained, versioned files (e.g. `.briefcase`) carrying their own metadata (when, which target, why) and resolved names, so they can be analyzed after the process is gone.
@@ -104,10 +112,10 @@ Self-contained, versioned files (e.g. `.briefcase`) carrying their own metadata 
 
 | Data | Volume | Store |
 |---|---|---|
-| Time series | Small (≈1.7M points/day per process at 20 metrics × 1 Hz) | DuckDB |
+| Time series | Small (≈2.6M points/day per process at ~30 series × 1 Hz) | DuckDB |
 | Events | Small–medium | DuckDB |
 | Artifacts (`.briefcase`) | Large (100 MB – several GB each) | Files on disk (object storage later), indexed in DuckDB |
-| Metadata (targets, capabilities, artifact index, markers) | Tiny | DuckDB |
+| Metadata (targets, series descriptors, collector info, artifact index, markers) | Tiny | DuckDB |
 | Analysis results (per-type stats, top dominators, diffs) | Small tables | DuckDB |
 
 Rules:
@@ -116,6 +124,17 @@ Rules:
 3. Retention from day one: full-resolution telemetry kept a few days, then downsampled (1 s → 1 min); only last N snapshots or incident-linked snapshots kept.
 4. High-frequency data (allocation-tick reconstruction, ms polling) goes to an in-memory ring buffer for the live UI and is stored only briefly at full resolution.
 5. Timestamps: UTC, nanosecond precision, everywhere (needed to correlate .NET with Postgres later). Also keep a monotonic timestamp for intervals within one process when available.
+
+**Why telemetry is persisted.** Investigation happens after the fact (a rule fires at 03:14, the LLM is asked in the morning). Snapshots answer *what* is in memory and *why* it is alive; stored telemetry answers *when* and *how fast*: when growth started, whether sawtooth bottoms rise, managed vs native, memory around each snapshot marker, before vs after a fix. The live chart and rules work on recent data and use the in-memory ring buffer.
+
+### 4.1 Time-series layout and retention (DuckDB)
+
+- Tables: `series` (one row per `SeriesDescriptor`) and `points (series_id, ts_utc_ns, value)`. Points arrive in time order, so all series are interleaved within each row group (~122,880 rows). Queries skip row groups by `ts` (zone maps) but not by `series_id`; with ~30 series that means reading up to ~30× the needed rows — well under a millisecond at our volume. It only matters with thousands of series per table (see the label rule in §3.2).
+- No index on `series_id`: it slows inserts and zone maps already do the skipping.
+- DuckDB is an embedded library with no scheduler or built-in retention. The retention job is ours: a background task in `wolf-host` (the single writer) that, in one transaction, downsamples raw points older than the full-resolution window into `points_1m` and deletes them.
+- `points_1m` keeps `min`, `max`, `avg` and `last` per series per minute: `max` keeps spikes, `min` keeps the sawtooth bottoms (the leak signal, §5), `last` suits step series (gen1/gen2 size after each GC).
+- The job writes `points_1m` ordered by `(series_id, minute)`, so long-term data is grouped by series and queries can skip by `series_id` too.
+- Deleted rows free space inside the file for reuse; the file does not shrink.
 
 ---
 

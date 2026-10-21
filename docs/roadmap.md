@@ -21,7 +21,7 @@ Phased plan. Each task is sized to be implemented in one focused session (human 
 | ✅ P0-1 | Cargo workspace with crates from `collector-dotnet.md` §7 (empty stubs), `rustfmt`, `clippy`, CI (build + test on Linux and Windows) | `cargo test` passes in CI on both OSes |
 | ✅ P0-2 | `docs/` with these documents; `AGENTS.md` (or `CLAUDE.md`) pointing AI assistants to them and listing ground rules | Docs in repo; agent file present |
 | ✅ P0-3 | `samples/` .NET 10 apps: `LeakyOrderService` (static event leak — reference scenario), `SteadyAllocator`, `LohChurn`, `NativeLeak` | Each runs with `dotnet run`; leak visible in `dotnet-counters` |
-| P0-4 | `wolf-contract`: types Point, Event, Capability, Command, CommandResult, ArtifactRef, TargetId; serde; schema version constant | Unit tests for (de)serialization |
+| ✅ P0-4 | `wolf-contract`: types SeriesDescriptor, Point, Event, CollectorInfo, Command, CommandResult, ArtifactRef, TargetId; serde; schema version constant | Unit tests for (de)serialization |
 
 ## Phase 1 — "Watch": live telemetry
 
@@ -33,7 +33,7 @@ Phased plan. Each task is sized to be implemented in one focused session (human 
 | P1-4 | `wolf-dotnet`: decode GCStart, GCEnd, GCHeapStats, suspend/restart events; produce `dotnet.gc` events with pause; gen0 per-second aggregation | Event counts and gen sizes match `dotnet-trace` + PerfView for the same run (± rounding) |
 | P1-5 | `wolf-dotnet`: EventCounters (`System.Runtime`) → timer series per catalogue | Values match `dotnet-counters` within tolerance |
 | P1-6 | `wolf-process`: OS memory metrics (Linux `/proc` + cgroup; Windows `GetProcessMemoryInfo`) | Values match `top`/`ps` / Task Manager |
-| P1-7 | `wolf-storage`: storage trait; DuckDB impl for points, events, targets; batch inserts; range queries; retention job (downsample 1 s → 1 min) | Insert 1M points < few seconds; range query tests; retention test |
+| P1-7 | `wolf-storage`: storage trait; DuckDB impl for points, events, targets; batch inserts; range queries; retention job (downsample 1 s → 1 min; see `architecture.md` §4.1) | Insert 1M points < few seconds; range query tests; retention test |
 | P1-8 | `wolf-host`: run collectors per target, route to storage, self-telemetry, graceful detach | Runs for 1 h against `SteadyAllocator` with stable memory and no drops |
 | P1-9 | `wolf watch <pid>`: terminal view (table or simple TUI chart) of gen sizes, heap total, process memory, GC events | Developer can watch `LeakyOrderService` grow live |
 

@@ -17,6 +17,8 @@ wolf-dotnet = { path = "crates/wolf-dotnet" }
 wolf-process = { path = "crates/wolf-process" }
 wolf-briefcase = { path = "crates/wolf-briefcase" }
 wolf-storage = { path = "crates/wolf-storage" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

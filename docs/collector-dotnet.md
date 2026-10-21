@@ -28,7 +28,7 @@ Out of scope: analysis, anomaly detection, long-term storage, LLM interaction.
 Steps:
 1. List candidate sockets/pipes; extract PIDs; drop stale ones (process not alive).
 2. Connect; send **ProcessInfo** command → runtime version, command line, OS/arch *(verify command id / response layout)*.
-3. Register target `pid:<pid>@<host>` with metadata; emit `target.attached` event.
+3. Register target `pid:<pid>.<start>@<host>` (start time from the OS, see `architecture.md` §3.1) with metadata; emit `target.attached` event.
 4. Open the telemetry session (§3).
 
 **Containers:** collector must reach the socket (sidecar sharing `/tmp`) or use **reverse diagnostic ports** (`DOTNET_DiagnosticPorts`) where the app connects to the collector. Support for reverse ports: phase 2+.
@@ -106,7 +106,7 @@ Events:
 | `target.attached` / `target.detached` | metadata / reason |
 | `session.started` / `session.lost` | session kind, reason |
 
-Self-telemetry (`source: "wolf"`): `wolf.collector.events_received`, `wolf.collector.events_dropped`, `wolf.collector.bytes_received`, `wolf.collector.cpu`, `wolf.collector.memory`, `wolf.collector.lag_ms`.
+Self-telemetry (metric prefix `wolf.`): `wolf.collector.events_received`, `wolf.collector.events_dropped`, `wolf.collector.bytes_received`, `wolf.collector.cpu`, `wolf.collector.memory`, `wolf.collector.lag_ms`.
 
 ---
 
@@ -129,12 +129,14 @@ Derived (by storage/analysis, not the collector): `unmanaged = process.memory.pr
 
 ## 6. Command: `heap_snapshot`
 
+The .NET collector reports `{ name: "dotnet", commands: ["heap_snapshot"] }` (`architecture.md` §3.4). Command name, params and artifact kind `briefcase` are constants in `wolf-dotnet`, not in `wolf-contract`.
+
 ### 6.1 Safety checks (collector-enforced)
 - `min_interval_s` per target (default 300).
 - At most 1 snapshot in progress per target, and a global max concurrency (default 1).
 - Free disk space check (estimate ≈ 40 bytes/object; reject if insufficient).
 - Optional: reject if heap > configured max size.
-- Rejections return `status: "rejected"` with a reason; emit an event.
+- Rejections return `status: "rejected"` with the reason in `message`; emit an event.
 
 ### 6.2 Capture (EventPipe heap dump, same approach as `dotnet-gcdump`)
 1. Open a **second, separate** EventPipe session with the GC heap-dump keyword set (GC + GCHeapCollect + GCHeapDump + Type + GCHeapAndTypeNames, level Verbose) *(verify exact keywords by reading `dotnet-gcdump` source)*. This triggers an induced full GC and a heap walk.
@@ -153,10 +155,10 @@ Two-pass build, off the hot path — see `briefcase-format.md` §4.
 
 ### 6.4 Result
 ```text
-{ command_id, status: "done", artifact: "srv-a_4812_2026-10-19T03-14-05.briefcase",
-  objects: 3104552, size_mb: 105, pause_ms: 640 }
+{ command_id, status: "done",
+  artifact: { kind: "briefcase", path: "srv-a_4812_2026-10-19T03-14-05.briefcase" } }
 ```
-Plus artifact index row in storage.
+Measurements go into the `dotnet.snapshot.finished` event: `{ command_id, artifact, objects: 3104552, size_mb: 105, pause_ms: 640 }`. Plus artifact index row in storage.
 
 ---
 
