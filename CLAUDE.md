@@ -31,7 +31,7 @@ Rust (tokio, memmap2, bytemuck/zerocopy, duckdb). Cargo workspace with crates li
 - `crates/<name>/` — one crate per component. Libraries keep logic; binaries (`wolf-host`, later the CLI and MCP server) stay thin.
 - Add a crate only when a roadmap task needs it (planned: analysis, rules, MCP, CLI). Add new dependencies to the crate that uses them, not ahead of time.
 - `samples/` — .NET 10 test apps (`Samples.slnx`); see `samples/README.md` for each app's expected memory shape.
-- `testdata/` — recorded `.nettrace` streams and other golden files (created with the first parser).
+- `testdata/` — recorded golden files (`ipc/` IPC responses, later `.nettrace` streams). Record with the crate's `examples/record_*`; check recordings for user names, paths and secrets before committing.
 - `.github/workflows/ci.yml` — fmt, clippy, build, test on Linux and Windows.
 - Task status lives in `docs/roadmap.md` (✅ prefix on the task ID).
 

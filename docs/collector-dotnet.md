@@ -22,12 +22,17 @@ Out of scope: analysis, anomaly detection, long-term storage, LLM interaction.
 
 ## 2. Discovery and attach
 
-**Linux/macOS:** each .NET Core 3.0+ process creates a Unix domain socket in `$TMPDIR` (default `/tmp`) named like `dotnet-diagnostic-<pid>-<key>-socket` *(verify)*.
-**Windows:** named pipe `\\.\pipe\dotnet-diagnostic-<pid>` *(verify)*.
+Verified against `dotnet/diagnostics` (`documentation/design-docs/ipc-protocol.md` and `Microsoft.Diagnostics.NETCore.Client`); implemented in `crates/wolf-ipc`.
+
+**Linux/macOS:** each .NET Core 3.0+ process creates a Unix domain socket `dotnet-diagnostic-<pid>-<key>-socket` in the process's `$TMPDIR` (default `/tmp`). `<key>` is the process start time (jiffies since boot from `/proc/<pid>/stat` on Linux, Unix seconds on macOS). A reused PID can leave several sockets: the newest wins.
+**Windows:** named pipe `\\.\pipe\dotnet-diagnostic-<pid>`.
+
+**Messages:** 20-byte header — magic `"DOTNET_IPC_V1\0"` (14 bytes), `u16` total size (header + payload), `u8` command set, `u8` command id, `u16` reserved (0) — then the payload. Little-endian. Strings: `u32` length in UTF-16 units including the trailing NUL, then the units; length 0 = empty. Responses: `0xFF00` OK, `0xFFFF` error with an `i32` HRESULT payload (e.g. `0x80131385` UNKNOWN_COMMAND); the runtime closes the connection after an error.
 
 Steps:
-1. List candidate sockets/pipes; extract PIDs; drop stale ones (process not alive).
-2. Connect; send **ProcessInfo** command → runtime version, command line, OS/arch *(verify command id / response layout)*.
+1. List sockets/pipes; extract PIDs; drop stale ones (Linux: no `/proc/<pid>`; elsewhere: connect fails).
+2. Connect; send **ProcessInfo3** (`0x0408`), falling back to ProcessInfo2 (`0x0404`) and ProcessInfo (`0x0400`) on UNKNOWN_COMMAND, as `dotnet-counters` does. Payload: `u32` version (v3 only), `u64` pid, 16-byte runtime cookie (GUID), command line, OS, arch, then (v2+) entrypoint assembly and CLR product version, then (v3 payload version ≥ 1) runtime identifier. Newer versions append fields; ignore the rest. *The doc's C struct lists a different field order; the field list and the client code are authoritative.*
+   Not covered yet: processes with a different `TMPDIR` and other mount namespaces (Microsoft's client finds them via `/proc/<pid>/environ` and `/proc/<pid>/root`).
 3. Register target `pid:<pid>.<start>@<host>` (start time from the OS, see `architecture.md` §3.1) with metadata; emit `target.attached` event.
 4. Open the telemetry session (§3).
 
