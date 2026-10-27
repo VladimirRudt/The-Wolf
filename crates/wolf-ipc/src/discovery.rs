@@ -1,3 +1,5 @@
+//! Finding running .NET processes by their diagnostic endpoints.
+
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -15,6 +17,10 @@ pub struct Endpoint {
 /// Scans `\\.\pipe\` on Windows and `$TMPDIR` (or `/tmp`) elsewhere, as the runtime places
 /// them there. Not covered yet: processes started with a different `TMPDIR`, other mount
 /// namespaces (containers) and macOS app sandboxes.
+///
+/// # Errors
+///
+/// Fails only if the directory itself cannot be listed; unreadable entries are skipped.
 pub fn discover() -> io::Result<Vec<Endpoint>> {
     let root = if cfg!(windows) {
         PathBuf::from(r"\\.\pipe\")
@@ -75,28 +81,6 @@ fn all_digits(s: &str) -> bool {
 /// endpoint fails to connect.
 fn is_alive(pid: u32) -> bool {
     !cfg!(target_os = "linux") || Path::new("/proc").join(pid.to_string()).exists()
-}
-
-#[cfg(unix)]
-pub(crate) async fn connect(endpoint: &Endpoint) -> io::Result<tokio::net::UnixStream> {
-    tokio::net::UnixStream::connect(&endpoint.path).await
-}
-
-#[cfg(windows)]
-pub(crate) async fn connect(
-    endpoint: &Endpoint,
-) -> io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
-    use tokio::net::windows::named_pipe::ClientOptions;
-    // All pipe instances are in use: retry shortly. Callers bound the total time.
-    const ERROR_PIPE_BUSY: i32 = 231;
-    loop {
-        match ClientOptions::new().open(&endpoint.path) {
-            Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-            result => return result,
-        }
-    }
 }
 
 #[cfg(test)]

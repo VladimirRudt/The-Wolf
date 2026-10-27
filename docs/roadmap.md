@@ -28,7 +28,7 @@ Phased plan. Each task is sized to be implemented in one focused session (human 
 | ID | Task | Done when |
 |---|---|---|
 | P1-1 | `wolf-ipc`: discover diagnostics sockets/pipes; connect; ProcessInfo command | Lists running .NET processes with runtime version and command line on Linux and Windows |
-| P1-2 | `wolf-ipc`: CollectTracing / StopTracing commands; return a byte stream | Can start a session against a sample app and save the raw stream to a `.nettrace` file that PerfView/TraceEvent can open |
+| ✅ P1-2 | `wolf-ipc`: CollectTracing / StopTracing commands; return a byte stream | Can start a session against a sample app and save the raw stream to a `.nettrace` file that PerfView/TraceEvent can open |
 | P1-3 | `wolf-nettrace`: parser for header, metadata, event, stack and sequence-point blocks; yields typed events with payload bytes | Golden-file tests pass on streams recorded from P1-2 |
 | P1-4 | `wolf-dotnet`: decode GCStart, GCEnd, GCHeapStats, suspend/restart events; produce `dotnet.gc` events with pause; gen0 per-second aggregation | Event counts and gen sizes match `dotnet-trace` + PerfView for the same run (± rounding) |
 | P1-5 | `wolf-dotnet`: EventCounters (`System.Runtime`) → timer series per catalogue | Values match `dotnet-counters` within tolerance |

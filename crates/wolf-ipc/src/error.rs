@@ -2,52 +2,30 @@ use std::{fmt, io};
 
 use crate::CommandCode;
 
-#[derive(Debug)]
+/// Failure talking to a .NET process.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum IpcError {
-    Io(io::Error),
+    #[error("diagnostics IPC I/O error: {0}")]
+    Io(#[from] io::Error),
     /// The runtime did not answer in time.
+    #[error("diagnostics IPC request timed out")]
     Timeout,
     /// The response does not start with the protocol magic.
+    #[error("diagnostics IPC message has an unknown magic")]
     BadMagic,
     /// The message is structurally invalid; the text says what was wrong.
+    #[error("malformed diagnostics IPC message: {0}")]
     Malformed(&'static str),
     /// The payload does not fit the 16-bit message size.
+    #[error("IPC payload of {0} bytes is too large")]
     PayloadTooLarge(usize),
     /// The runtime answered with an error message.
+    #[error("runtime returned error {0}")]
     Server(ServerError),
     /// The runtime answered with something other than OK or Error.
+    #[error("unexpected IPC response 0x{:02X}{:02X}", .0.set, .0.id)]
     UnexpectedResponse(CommandCode),
-}
-
-impl fmt::Display for IpcError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Io(e) => write!(f, "diagnostics IPC I/O error: {e}"),
-            Self::Timeout => write!(f, "diagnostics IPC request timed out"),
-            Self::BadMagic => write!(f, "diagnostics IPC message has an unknown magic"),
-            Self::Malformed(what) => write!(f, "malformed diagnostics IPC message: {what}"),
-            Self::PayloadTooLarge(len) => write!(f, "IPC payload of {len} bytes is too large"),
-            Self::Server(e) => write!(f, "runtime returned error {e}"),
-            Self::UnexpectedResponse(c) => {
-                write!(f, "unexpected IPC response 0x{:02X}{:02X}", c.set, c.id)
-            }
-        }
-    }
-}
-
-impl std::error::Error for IpcError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(e) => Some(e),
-            _ => None,
-        }
-    }
-}
-
-impl From<io::Error> for IpcError {
-    fn from(e: io::Error) -> Self {
-        Self::Io(e)
-    }
 }
 
 /// HRESULT sent by the runtime in an error response.
@@ -101,5 +79,17 @@ mod tests {
             "0x80131385 (UNKNOWN_COMMAND)"
         );
         assert_eq!(ServerError(0x1234).to_string(), "0x00001234");
+    }
+
+    #[test]
+    fn error_messages() {
+        assert_eq!(
+            IpcError::Server(ServerError::NOT_SUPPORTED).to_string(),
+            "runtime returned error 0x80131515 (NOT_SUPPORTED)"
+        );
+        assert_eq!(
+            IpcError::UnexpectedResponse(CommandCode::PROCESS_INFO).to_string(),
+            "unexpected IPC response 0x0400"
+        );
     }
 }

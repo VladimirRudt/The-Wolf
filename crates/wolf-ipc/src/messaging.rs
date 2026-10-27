@@ -1,3 +1,8 @@
+//! Wire format of the Diagnostic IPC protocol: message header, command codes and the
+//! encoding of payload fields. No knowledge of individual commands.
+
+use std::io;
+
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{IpcError, ServerError};
@@ -6,7 +11,7 @@ use crate::{IpcError, ServerError};
 pub const PROTOCOL_MAGIC: &[u8; 14] = b"DOTNET_IPC_V1\0";
 
 /// magic (14) + size (2) + command set (1) + command id (1) + reserved (2).
-const HEADER_SIZE: usize = 20;
+pub(crate) const HEADER_SIZE: usize = 20;
 
 /// Command set and id: together they name a command, or a server response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -16,6 +21,9 @@ pub struct CommandCode {
 }
 
 impl CommandCode {
+    pub const STOP_TRACING: Self = Self::new(0x02, 0x01);
+    pub const COLLECT_TRACING2: Self = Self::new(0x02, 0x03);
+    pub const COLLECT_TRACING3: Self = Self::new(0x02, 0x04);
     pub const PROCESS_INFO: Self = Self::new(0x04, 0x00);
     pub const PROCESS_INFO2: Self = Self::new(0x04, 0x04);
     pub const PROCESS_INFO3: Self = Self::new(0x04, 0x08);
@@ -36,6 +44,10 @@ pub struct Message {
 
 impl Message {
     /// Wire bytes of a message.
+    ///
+    /// # Errors
+    ///
+    /// [`IpcError::PayloadTooLarge`] if header plus payload exceed the 16-bit size field.
     pub fn encode(command: CommandCode, payload: &[u8]) -> Result<Vec<u8>, IpcError> {
         let size = u16::try_from(HEADER_SIZE + payload.len())
             .map_err(|_| IpcError::PayloadTooLarge(payload.len()))?;
@@ -49,11 +61,16 @@ impl Message {
         Ok(bytes)
     }
 
+    /// Wire bytes of this message.
+    ///
+    /// # Errors
+    ///
+    /// See [`Message::encode`].
     pub fn to_bytes(&self) -> Result<Vec<u8>, IpcError> {
         Self::encode(self.command, &self.payload)
     }
 
-    pub async fn write<S: AsyncWrite + Unpin>(
+    pub(crate) async fn write<S: AsyncWrite + Unpin>(
         stream: &mut S,
         command: CommandCode,
         payload: &[u8],
@@ -63,9 +80,46 @@ impl Message {
         Ok(())
     }
 
+    /// Blocking twin of [`Message::write`], for the streaming path (std I/O, no tokio).
+    pub(crate) fn write_blocking<W: io::Write>(
+        stream: &mut W,
+        command: CommandCode,
+        payload: &[u8],
+    ) -> Result<(), IpcError> {
+        stream.write_all(&Self::encode(command, payload)?)?;
+        stream.flush()?;
+        Ok(())
+    }
+
+    /// Reads one message: the header, then exactly the payload it announces.
+    ///
+    /// # Errors
+    ///
+    /// [`IpcError::Io`] if the stream ends early, [`IpcError::BadMagic`] or
+    /// [`IpcError::Malformed`] if the header is invalid.
     pub async fn read<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Self, IpcError> {
         let mut header = [0u8; HEADER_SIZE];
         stream.read_exact(&mut header).await?;
+        let (command, payload_len) = Self::parse_header(&header)?;
+        let mut payload = vec![0; payload_len];
+        stream.read_exact(&mut payload).await?;
+        Ok(Self { command, payload })
+    }
+
+    /// Blocking twin of [`Message::read`], for the streaming path (std I/O, no tokio).
+    pub(crate) fn read_blocking<R: io::Read>(stream: &mut R) -> Result<Self, IpcError> {
+        let mut header = [0u8; HEADER_SIZE];
+        stream.read_exact(&mut header)?;
+        let (command, payload_len) = Self::parse_header(&header)?;
+        let mut payload = vec![0; payload_len];
+        stream.read_exact(&mut payload)?;
+        Ok(Self { command, payload })
+    }
+
+    /// Validates a header; returns the command code and the payload length it announces.
+    pub(crate) fn parse_header(
+        header: &[u8; HEADER_SIZE],
+    ) -> Result<(CommandCode, usize), IpcError> {
         let (magic, rest) = header.split_at(PROTOCOL_MAGIC.len());
         if magic != PROTOCOL_MAGIC {
             return Err(IpcError::BadMagic);
@@ -74,15 +128,15 @@ impl Message {
         let payload_len = size.checked_sub(HEADER_SIZE).ok_or(IpcError::Malformed(
             "message size is smaller than the header",
         ))?;
-        let mut payload = vec![0; payload_len];
-        stream.read_exact(&mut payload).await?;
-        Ok(Self {
-            command: CommandCode::new(rest[2], rest[3]),
-            payload,
-        })
+        Ok((CommandCode::new(rest[2], rest[3]), payload_len))
     }
 
-    /// The payload of an OK response; an error response becomes [`IpcError::Server`].
+    /// The payload of an OK response.
+    ///
+    /// # Errors
+    ///
+    /// [`IpcError::Server`] for an error response, [`IpcError::UnexpectedResponse`] for any
+    /// other command code.
     pub fn into_ok_payload(self) -> Result<Vec<u8>, IpcError> {
         match self.command {
             CommandCode::SERVER_OK => Ok(self.payload),
@@ -133,9 +187,9 @@ impl<'a> PayloadReader<'a> {
     /// `string` = u32 length in UTF-16 units (including the terminating NUL), then the units.
     /// Length 0 is the empty string. Invalid UTF-16 is replaced, not rejected.
     pub(crate) fn string(&mut self) -> Result<String, IpcError> {
-        let len = self.u32()? as usize;
-        let byte_len = len
-            .checked_mul(2)
+        let byte_len = usize::try_from(self.u32()?)
+            .ok()
+            .and_then(|len| len.checked_mul(2))
             .ok_or(IpcError::Malformed("string length overflows"))?;
         let units: Vec<u16> = self
             .take(byte_len)?
@@ -147,47 +201,63 @@ impl<'a> PayloadReader<'a> {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod test_support {
-    /// Builds payloads in the protocol's encoding.
-    #[derive(Default)]
-    pub(crate) struct PayloadBuilder(Vec<u8>);
+/// Writes payload fields in the protocol's encoding; the counterpart of [`PayloadReader`].
+#[derive(Debug, Default)]
+pub(crate) struct PayloadWriter(Vec<u8>);
 
-    impl PayloadBuilder {
-        pub(crate) fn u32(mut self, value: u32) -> Self {
-            self.0.extend_from_slice(&value.to_le_bytes());
-            self
-        }
+impl PayloadWriter {
+    #[must_use]
+    pub(crate) fn bool(mut self, value: bool) -> Self {
+        self.0.push(u8::from(value));
+        self
+    }
 
-        pub(crate) fn u64(mut self, value: u64) -> Self {
-            self.0.extend_from_slice(&value.to_le_bytes());
-            self
-        }
+    #[must_use]
+    pub(crate) fn u32(mut self, value: u32) -> Self {
+        self.0.extend_from_slice(&value.to_le_bytes());
+        self
+    }
 
-        pub(crate) fn bytes(mut self, bytes: &[u8]) -> Self {
-            self.0.extend_from_slice(bytes);
-            self
-        }
+    #[must_use]
+    pub(crate) fn u64(mut self, value: u64) -> Self {
+        self.0.extend_from_slice(&value.to_le_bytes());
+        self
+    }
 
-        pub(crate) fn string(mut self, value: &str) -> Self {
-            let mut units: Vec<u16> = value.encode_utf16().collect();
-            units.push(0);
-            self = self.u32(units.len() as u32);
-            for unit in units {
-                self.0.extend_from_slice(&unit.to_le_bytes());
-            }
-            self
-        }
+    /// Writes a length or element count. A count beyond `u32` can never be sent (a message is at
+    /// most 64 KB and [`Message::encode`] rejects it), so saturating loses nothing.
+    #[must_use]
+    pub(crate) fn count(self, count: usize) -> Self {
+        self.u32(u32::try_from(count).unwrap_or(u32::MAX))
+    }
 
-        pub(crate) fn build(self) -> Vec<u8> {
-            self.0
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn bytes(mut self, bytes: &[u8]) -> Self {
+        self.0.extend_from_slice(bytes);
+        self
+    }
+
+    /// Length in UTF-16 units including the terminating NUL, then the units. An empty string
+    /// is written as just the NUL, as `Microsoft.Diagnostics.NETCore.Client` does.
+    #[must_use]
+    pub(crate) fn string(mut self, value: &str) -> Self {
+        let mut units: Vec<u16> = value.encode_utf16().collect();
+        units.push(0);
+        self = self.count(units.len());
+        for unit in units {
+            self.0.extend_from_slice(&unit.to_le_bytes());
         }
+        self
+    }
+
+    pub(crate) fn build(self) -> Vec<u8> {
+        self.0
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::PayloadBuilder;
     use super::*;
 
     #[test]
@@ -216,6 +286,22 @@ mod tests {
         let message = Message::read(&mut &buffer[..]).await.expect("read");
         assert_eq!(message.command, CommandCode::SERVER_OK);
         assert_eq!(message.into_ok_payload().expect("ok"), [1, 2, 3]);
+    }
+
+    #[test]
+    fn blocking_reads_what_it_writes() {
+        let mut buffer = Vec::new();
+        Message::write_blocking(&mut buffer, CommandCode::SERVER_OK, &[1, 2, 3]).expect("write");
+        let message = Message::read_blocking(&mut &buffer[..]).expect("read");
+        assert_eq!(message.command, CommandCode::SERVER_OK);
+        assert_eq!(message.payload, [1, 2, 3]);
+
+        let mut bad = buffer.clone();
+        bad[0] = b'X';
+        assert!(matches!(
+            Message::read_blocking(&mut &bad[..]),
+            Err(IpcError::BadMagic)
+        ));
     }
 
     #[tokio::test]
@@ -252,7 +338,7 @@ mod tests {
     fn error_response_carries_hresult() {
         let message = Message {
             command: CommandCode::SERVER_ERROR,
-            payload: PayloadBuilder::default().u32(0x8013_1385).build(),
+            payload: PayloadWriter::default().u32(0x8013_1385).build(),
         };
         assert!(matches!(
             message.into_ok_payload(),
@@ -274,7 +360,7 @@ mod tests {
 
     #[test]
     fn reads_strings() {
-        let payload = PayloadBuilder::default()
+        let payload = PayloadWriter::default()
             .string("héllo")
             .u32(0) // empty string encoded as length 0
             .build();
@@ -285,7 +371,7 @@ mod tests {
 
     #[test]
     fn string_longer_than_payload_is_malformed() {
-        let payload = PayloadBuilder::default().u32(u32::MAX).build();
+        let payload = PayloadWriter::default().u32(u32::MAX).build();
         assert!(matches!(
             PayloadReader::new(&payload).string(),
             Err(IpcError::Malformed(_))

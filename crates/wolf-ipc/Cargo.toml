@@ -9,10 +9,11 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-tokio = { workspace = true, features = ["net", "io-util", "time"] }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "io-util", "time", "sync"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
 
 [lints]
 workspace = true

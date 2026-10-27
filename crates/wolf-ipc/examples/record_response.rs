@@ -3,7 +3,7 @@
 
 use std::error::Error;
 
-use wolf_ipc::CommandCode;
+use wolf_ipc::{CommandCode, DiagnosticsClient};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -18,7 +18,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .into_iter()
         .find(|e| e.pid == pid)
         .ok_or("no diagnostic endpoint for this pid")?;
-    let message = wolf_ipc::request(&endpoint, CommandCode::PROCESS_INFO3, &[]).await?;
+    let client = DiagnosticsClient::new(endpoint);
+    let message = client.request(CommandCode::PROCESS_INFO3, &[]).await?;
     let bytes = message.to_bytes()?;
     std::fs::write(&out, &bytes)?;
     println!("wrote {} bytes to {out}", bytes.len());

@@ -172,6 +172,7 @@ gen 0                   ┘
 | D10 | Privacy by default: no string contents/field values in snapshots unless opted in | Heaps contain secrets/PII |
 | D11 | Collector self-telemetry (own overhead, dropped events) | Distinguish "app slow" from "Mr. Wolf made it slow" |
 | D12 | .NET 6+ targets only (EventPipe requires .NET Core 3.0+) | Modern runtimes |
+| D13 | **Data collection path is hand-written, blocking std I/O on one plain thread per session** (`EventSession::read_chunk`); tokio only for request/response commands and the rest of the host. No actor or streaming frameworks in the collection path | Critical path: full control over threads, buffering and ordering; backpressure is explicit (runtime buffer → pipe → reader thread → bounded `std::sync::mpsc`) |
 
 ---
 

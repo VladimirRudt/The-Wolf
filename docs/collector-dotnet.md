@@ -46,7 +46,7 @@ Lifecycle events: `target.attached`, `target.detached` (with reason: exited / so
 
 ## 3. Telemetry session (long-lived)
 
-Started with the IPC **CollectTracing** command (version 2+ supports rundown flag) *(verify)*. Disable rundown for telemetry sessions.
+Started with **CollectTracing3** (`0x0204`): `u32 circularBufferMB, u32 format (1 = NetTrace), bool requestRundown, bool requestStackwalk, array<provider>`, each provider `u64 keywords, u32 level, string name, string arguments` (`key=value;…`). Falls back to CollectTracing2 (`0x0203`, no stackwalk flag) on UNKNOWN_COMMAND. Telemetry sessions disable rundown and stacks. The OK response carries a `u64` session id; the raw nettrace stream follows on the same connection. **StopTracing** (`0x0201`, `u64` session id) goes on a new connection; the runtime then flushes and closes the stream (on Windows, the closed pipe surfaces as error 109/233 and is treated as end of stream). The streaming handshake is bounded by a 5 s timeout on both OSes: a socket read timeout on Unix; on Windows, where std has no pipe timeouts, the client polls `PeekNamedPipe` (non-consuming) until the whole response has arrived, then reads it. The ~100-byte request is written without a deadline: it fits the socket/pipe buffer. Verified against `EventPipeSession.cs` / `EventPipeSessionConfiguration.cs`; implemented in `wolf-ipc`: `DiagnosticsClient::start_session` is **blocking** (std I/O, called on the session's reader thread, D13) and returns an `EventSession` read with `read_chunk` until it returns 0; `stop_session` is async (tokio) on a new connection. The client remembers when a runtime lacks CollectTracing3, so the fallback costs one round trip per process, not per session.
 
 Providers:
 
@@ -62,6 +62,8 @@ Providers:
 - Implement the `.nettrace` stream reader in Rust: header, metadata blocks (event schemas), event blocks, stack blocks, sequence point blocks *(verify format version — "Nettrace" v4/v5)*.
 - Decode only the events we need; skip others cheaply.
 - Keep per-session metadata (event id → schema).
+- **Chunks do not align with nettrace blocks.** `EventSession::read_chunk` returns whatever bytes the pipe has: a chunk can end in the middle of a block header, an event, or even a single integer, and one chunk can hold several blocks. The parser must therefore be **incremental**: `feed(chunk)` appends to an internal buffer, emits every complete unit it can, and keeps the incomplete tail for the next chunk. It must never assume a read starts or ends on a boundary, and its golden tests must replay recordings split at arbitrary points (including 1-byte chunks) and get identical output.
+- The parser is synchronous and runtime-agnostic (no tokio, no threads of its own, D13): it runs on the session's reader thread.
 
 ### 3.2 GC event handling
 - **Pause duration** = `GCRestartEEEnd.ts − GCSuspendEEBegin.ts` for the GC (more accurate than GCStart/GCEnd).
