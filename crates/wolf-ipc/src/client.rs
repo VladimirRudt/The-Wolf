@@ -101,13 +101,9 @@ impl DiagnosticsClient {
     ///
     /// Connection and protocol errors; an error *response* is returned as a [`Message`].
     pub async fn request(&self, command: CommandCode, payload: &[u8]) -> Result<Message, IpcError> {
-        tokio::time::timeout(REQUEST_TIMEOUT, async {
-            let mut stream = async_transport::connect(&self.endpoint).await?;
-            Message::write(&mut stream, command, payload).await?;
-            Message::read(&mut stream).await
-        })
-        .await
-        .map_err(|_| IpcError::Timeout)?
+        let (_stream, response) =
+            async_transport::exchange(&self.endpoint, command, payload, REQUEST_TIMEOUT).await?;
+        Ok(response)
     }
 
     // --- Streaming (blocking) ------------------------------------------------------------
@@ -115,7 +111,7 @@ impl DiagnosticsClient {
     /// Starts an EventPipe session and returns its byte stream.
     ///
     /// **Blocking.** Call it on the thread that will read the session, never inside an async
-    /// task. The handshake (connect, request, response) is bounded by a 5 s timeout on every
+    /// task. Connecting, sending the request and reading the response are bounded by a 5 s timeout on every
     /// platform; after it, reads wait as long as the stream needs.
     ///
     /// Uses CollectTracing3 when stacks are off and CollectTracing2 otherwise, as `dotnet-trace`
@@ -144,7 +140,7 @@ impl DiagnosticsClient {
         command: CommandCode,
         config: &SessionConfig,
     ) -> Result<EventSession, IpcError> {
-        let (stream, response) = blocking_transport::handshake(
+        let (stream, response) = blocking_transport::exchange(
             &self.endpoint,
             command,
             &config.encode(command),
@@ -196,7 +192,13 @@ fn is_closed_by_peer(e: &io::Error) -> bool {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Transports: one connection to a diagnostic endpoint.
+// Transports. Both expose the same operation:
+//
+//     exchange(endpoint, command, payload, timeout) -> (Stream, Message)
+//
+// connect, send one command, read its response, all within `timeout`; then hand back the
+// connection too, for commands that keep streaming on it. `async_transport` does it on tokio
+// (request/response); `blocking_transport` on plain std (the event stream, D13).
 // ---------------------------------------------------------------------------------------------
 
 /// Windows: all instances of the pipe are in use; retry shortly.
@@ -211,15 +213,34 @@ mod async_transport {
     use super::*;
 
     #[cfg(unix)]
-    pub(super) async fn connect(endpoint: &Endpoint) -> io::Result<tokio::net::UnixStream> {
-        tokio::net::UnixStream::connect(&endpoint.path).await
+    pub(super) type Stream = tokio::net::UnixStream;
+    #[cfg(windows)]
+    pub(super) type Stream = tokio::net::windows::named_pipe::NamedPipeClient;
+
+    pub(super) async fn exchange(
+        endpoint: &Endpoint,
+        command: CommandCode,
+        payload: &[u8],
+        timeout: Duration,
+    ) -> Result<(Stream, Message), IpcError> {
+        tokio::time::timeout(timeout, async {
+            let mut stream = connect(endpoint).await?;
+            Message::write(&mut stream, command, payload).await?;
+            let response = Message::read(&mut stream).await?;
+            Ok((stream, response))
+        })
+        .await
+        .map_err(|_| IpcError::Timeout)?
     }
 
-    /// Callers bound the total time.
+    #[cfg(unix)]
+    async fn connect(endpoint: &Endpoint) -> io::Result<Stream> {
+        Stream::connect(&endpoint.path).await
+    }
+
+    /// Retries while all pipe instances are busy; `exchange`'s timeout bounds it.
     #[cfg(windows)]
-    pub(super) async fn connect(
-        endpoint: &Endpoint,
-    ) -> io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+    async fn connect(endpoint: &Endpoint) -> io::Result<Stream> {
         use tokio::net::windows::named_pipe::ClientOptions;
         loop {
             match ClientOptions::new().open(&endpoint.path) {
@@ -232,17 +253,15 @@ mod async_transport {
     }
 }
 
-/// Streaming connections (plain std, blocking).
+/// Streaming connections (plain std, blocking). After `exchange` the connection has no
+/// timeouts left: it is the event stream. Each platform bounds the response wait its own way.
+///
+/// The request is written without a deadline on both platforms: it is ~100 bytes and fits the
+/// socket/pipe buffer, so writing never waits for the runtime.
 mod blocking_transport {
     use super::*;
 
-    // `handshake(endpoint, command, payload, timeout) -> (Stream, Message)`: connects, sends one
-    // command and reads its response, all within `timeout`. The returned connection has no
-    // timeouts left: it is the event stream. Each platform bounds the wait its own way.
-    //
-    // The request is written without a deadline on both platforms: it is ~100 bytes and fits
-    // the socket/pipe buffer, so writing never waits for the runtime.
-    pub(super) use platform::{Stream, handshake};
+    pub(super) use platform::{Stream, exchange};
 
     /// Unix: a socket read timeout bounds the wait for the response.
     #[cfg(unix)]
@@ -251,7 +270,7 @@ mod blocking_transport {
 
         pub(in super::super) type Stream = std::os::unix::net::UnixStream;
 
-        pub(in super::super) fn handshake(
+        pub(in super::super) fn exchange(
             endpoint: &Endpoint,
             command: CommandCode,
             payload: &[u8],
@@ -280,7 +299,7 @@ mod blocking_transport {
 
     /// Windows: std has no timeouts for pipe I/O. Instead, before the (blocking) read, poll the
     /// pipe with `PeekNamedPipe` until the whole response has arrived or the deadline passes.
-    /// Peeking does not consume data, and it is only used during the handshake.
+    /// Peeking does not consume data, and it is only used while waiting for the response.
     #[cfg(windows)]
     mod platform {
         use std::ffi::c_void;
@@ -311,7 +330,7 @@ mod blocking_transport {
             ) -> i32;
         }
 
-        pub(in super::super) fn handshake(
+        pub(in super::super) fn exchange(
             endpoint: &Endpoint,
             command: CommandCode,
             payload: &[u8],
@@ -537,13 +556,13 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn streaming_handshake_times_out_when_runtime_never_answers() {
+    async fn blocking_exchange_times_out_when_runtime_never_answers() {
         let (endpoint, _server) =
             test_server::start(vec![test_server::silent(Duration::from_secs(3))]);
 
         let (result, elapsed) = tokio::task::spawn_blocking(move || {
             let started = std::time::Instant::now();
-            let result = blocking_transport::handshake(
+            let result = blocking_transport::exchange(
                 &endpoint,
                 CommandCode::COLLECT_TRACING3,
                 &[],
