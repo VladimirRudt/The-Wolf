@@ -229,6 +229,9 @@ dependencies = [
 [[package]]
 name = "wolf-nettrace"
 version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
 
 [[package]]
 name = "wolf-process"

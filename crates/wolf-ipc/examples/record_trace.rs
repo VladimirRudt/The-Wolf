@@ -1,4 +1,5 @@
-//! Records an EventPipe session with GC events to a `.nettrace` file:
+//! Records a telemetry-style EventPipe session (GC events + `System.Runtime` counters every
+//! second, no rundown) to a `.nettrace` file:
 //! `cargo run -p wolf-ipc --example record_trace -- <pid> <seconds> <out-file>`.
 //!
 //! Shows the intended split: a plain thread starts the session and reads chunks; the async
@@ -30,11 +31,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .find(|e| e.pid == pid)
         .ok_or("no diagnostic endpoint for this pid")?;
     let client = Arc::new(DiagnosticsClient::new(endpoint));
-    let config = SessionConfig::new(vec![Provider::new(
-        "Microsoft-Windows-DotNETRuntime",
-        GC_KEYWORD,
-        EventLevel::Informational,
-    )]);
+    let config = SessionConfig::new(vec![
+        Provider::new(
+            "Microsoft-Windows-DotNETRuntime",
+            GC_KEYWORD,
+            EventLevel::Informational,
+        ),
+        Provider::new("System.Runtime", 0, EventLevel::Informational)
+            .with_argument("EventCounterIntervalSec", "1"),
+    ]);
 
     // The streaming thread: start the session, report its id, then copy chunks to the file
     // until the runtime closes the stream.

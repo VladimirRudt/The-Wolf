@@ -27,9 +27,9 @@ Phased plan. Each task is sized to be implemented in one focused session (human 
 
 | ID | Task | Done when |
 |---|---|---|
-| P1-1 | `wolf-ipc`: discover diagnostics sockets/pipes; connect; ProcessInfo command | Lists running .NET processes with runtime version and command line on Linux and Windows |
+| ✅ P1-1 | `wolf-ipc`: discover diagnostics sockets/pipes; connect; ProcessInfo command | Lists running .NET processes with runtime version and command line on Linux and Windows |
 | ✅ P1-2 | `wolf-ipc`: CollectTracing / StopTracing commands; return a byte stream | Can start a session against a sample app and save the raw stream to a `.nettrace` file that PerfView/TraceEvent can open |
-| P1-3 | `wolf-nettrace`: parser for header, metadata, event, stack and sequence-point blocks; yields typed events with payload bytes | Golden-file tests pass on streams recorded from P1-2 |
+| ✅ P1-3 | `wolf-nettrace`: parser for header, metadata, event, stack and sequence-point blocks; yields typed events with payload bytes | Golden-file tests pass on streams recorded from P1-2 |
 | P1-4 | `wolf-dotnet`: decode GCStart, GCEnd, GCHeapStats, suspend/restart events; produce `dotnet.gc` events with pause; gen0 per-second aggregation | Event counts and gen sizes match `dotnet-trace` + PerfView for the same run (± rounding) |
 | P1-5 | `wolf-dotnet`: EventCounters (`System.Runtime`) → timer series per catalogue | Values match `dotnet-counters` within tolerance |
 | P1-6 | `wolf-process`: OS memory metrics (Linux `/proc` + cgroup; Windows `GetProcessMemoryInfo`) | Values match `top`/`ps` / Task Manager |
@@ -93,7 +93,7 @@ Phased plan. Each task is sized to be implemented in one focused session (human 
 
 ## Open questions
 
-- Exact `.nettrace` version(s) to support first (verify against runtime versions in use at work).
+- ~~Exact `.nettrace` version(s) to support first~~ — answered: NetTrace v4 framing + v5 metadata tags, written by every runtime .NET 6 → main; no runtime writes v6 (`collector-dotnet.md` §3.1).
 - Whether EventPipe heap dumps provide per-object generation; if not, how to derive it.
 - Rule configuration format (TOML/YAML).
 - UI tech for the MCP app chart.
