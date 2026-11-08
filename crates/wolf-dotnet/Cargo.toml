@@ -9,6 +9,9 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+serde_json.workspace = true
+wolf-contract.workspace = true
+wolf-nettrace.workspace = true
 
 [lints]
 workspace = true

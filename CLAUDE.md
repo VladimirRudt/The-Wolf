@@ -32,7 +32,7 @@ Rust (tokio, memmap2, bytemuck/zerocopy, duckdb). Cargo workspace with crates li
 - Add a crate only when a roadmap task needs it (planned: analysis, rules, MCP, CLI). Add new dependencies to the crate that uses them, not ahead of time.
 - `samples/` — .NET 10 test apps (`Samples.slnx`); see `samples/README.md` for each app's expected memory shape.
 - `testdata/` — recorded golden files (`ipc/` IPC responses, `nettrace/` EventPipe streams with their `.expected.txt`). Record with the crate's `examples/record_*`; check recordings for user names, paths and secrets before committing (every `.nettrace` contains the target's command line).
-- `tools/TraceCheck/` — C# tool (TraceEvent) that writes the `.expected.txt` for a `.nettrace` recording: `dotnet run --project tools/TraceCheck -- <in.nettrace> <out.expected.txt>`. Run manually, not in CI.
+- `tools/TraceCheck/` — C# tool (TraceEvent) that writes the expected files for a `.nettrace` recording: events (`<name>.expected.txt`, for `wolf-nettrace`): `dotnet run --project tools/TraceCheck -- <in.nettrace> <out.expected.txt>`; GCs (`<name>.gc.expected.txt`, for `wolf-dotnet`): `dotnet run --project tools/TraceCheck -- gc <in.nettrace> <out.gc.expected.txt>`. Run manually, not in CI.
 - `.github/workflows/ci.yml` — fmt, clippy, build, test on Linux and Windows.
 - Task status lives in `docs/roadmap.md` (✅ prefix on the task ID).
 

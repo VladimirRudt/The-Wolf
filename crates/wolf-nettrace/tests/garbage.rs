@@ -46,7 +46,9 @@ fn corrupted_recordings_never_panic() {
             continue;
         }
         let original = std::fs::read(&path).expect("recording");
-        for round in 0..2000 {
+        // About the same parsing work per recording, whatever its size.
+        let rounds = (50_000_000 / original.len()).clamp(100, 2000);
+        for round in 0..rounds {
             let mut stream = original.clone();
             // Half the rounds hit the stream header and Trace object, which are tiny but
             // decide how everything after them is read.

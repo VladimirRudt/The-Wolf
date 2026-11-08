@@ -213,6 +213,11 @@ dependencies = [
 [[package]]
 name = "wolf-dotnet"
 version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "wolf-contract",
+ "wolf-nettrace",
+]
 
 [[package]]
 name = "wolf-host"

@@ -52,7 +52,7 @@ Providers:
 
 | Provider | Keywords | Level | Purpose |
 |---|---|---|---|
-| `Microsoft-Windows-DotNETRuntime` | GC (`0x1`) | Informational (4) | GCStart, GCEnd, GCHeapStats, GCSuspendEEBegin/End, GCRestartEEBegin/End |
+| `Microsoft-Windows-DotNETRuntime` | GC (`0x1`) | Informational (4) | GCStart, GCEnd, GCHeapStats, GCGlobalHeapHistory, GCSuspendEEBegin, GCRestartEEEnd (§3.2) |
 | `System.Runtime` (EventCounters) | — | Informational | Counters; filter arg `EventCounterIntervalSec=1` (configurable) |
 | *(phase 3)* `Microsoft-Windows-DotNETRuntime` | GC (`0x1`) | Verbose (5) | adds GCAllocationTick |
 
@@ -77,15 +77,62 @@ Providers:
   - `commit(n, on_item)` advances `end`, parses every complete block, advances `start`, and passes each item to the callback with its payload **borrowed** from the buffer (no per-event allocation; the borrow ends when the callback returns).
   - A block header larger than the buffer is a corrupt stream: error, end the session (no resync possible).
 - **Backpressure is the blocking read itself:** a slow callback stops `read_chunk`, the pipe fills, the runtime's circular buffer fills, and the runtime **drops** events rather than blocking the app. There is no queue between reading and parsing, so nothing grows; drops show up as sequence-number gaps and are counted in self-telemetry.
-- **Events are emitted in file order; the parser never sorts.** The runtime does not time-sort the stream (NetTrace v5 spec, "Event TimeStamp sorting"); sorting would mean holding events back and copying their payloads. No planned consumer infers anything from arrival order: GC events are correlated by GC number, durations come from timestamps, storage orders by `ts` on query. The `IsSorted` flag is parsed past and not exposed.
+- **Events are emitted in file order; the parser never sorts.** The runtime does not time-sort the stream (NetTrace v5 spec, "Event TimeStamp sorting"); sorting would mean holding events back and copying their payloads. No planned consumer infers anything from arrival order: GC events are correlated by GC number and per-thread order (§3.2), durations come from timestamps, storage orders by `ts` on query. The `IsSorted` flag is parsed past and not exposed.
 - **Sequence points are rare** — the runtime writes one per 10 MB of event buffers, not on a timer (`ep-session.c`, `ep-buffer-manager.c`); telemetry recordings contain a single SPBlock at the end. They are not usable as a time watermark. The parser uses them only for **dropped-event detection**: per capture thread, `SequenceNumber` must increase by 1 (a gap = dropped events; a reset to 1 = thread id reused, treated as a new thread), and a sequence point's per-thread numbers expose threads whose events are all being dropped.
 - The parser is synchronous and runtime-agnostic (no tokio, no threads of its own, D13): it runs on the session's reader thread.
 
 ### 3.2 GC event handling
-- **Pause duration** = `GCRestartEEEnd.ts − GCSuspendEEBegin.ts` for the GC (more accurate than GCStart/GCEnd).
-- From `GCStart`: count (GC number), depth (generation), reason, type (blocking / background / foreground).
-- From `GCHeapStats` (V2 where available): per-generation size and promoted bytes for gen0/1/2, LOH, POH; finalization-promoted count; pinned object count; GC handle count *(verify field names per version)*.
-- Correlate events of one GC by GC number, never by file order (events are not time-sorted, §3.1).
+
+**Spec for event sequences:** Maoni Stephens, [GC ETW Events – 3](https://devblogs.microsoft.com/dotnet/gc-etw-events-3/); TraceEvent `TraceManagedProcess.cs` (PerfView GCStats) is the reference implementation. Our recordings (steady gen0/gen1 and `LohChurn` background GCs, .NET 10) match it.
+
+```text
+Blocking GC (all gen0/gen1, full blocking gen2):
+  SuspendEE → SuspendEEEnd → GCStart → GCEnd → RestartEEBegin → RestartEEEnd
+Background GC (gen2 only):
+  SuspendEE → SuspendEEEnd → GCStart(BGC) → RestartEEBegin → RestartEEEnd     1st pause (app thread)
+  SuspendEE(GCPrep) → SuspendEEEnd → RestartEEBegin → RestartEEEnd            2nd pause (BGC thread)
+  GCEnd(BGC)                                                                  (BGC thread)
+  • foreground GCs (blocking sequence, gen0/gen1) may run between the pauses and before GCEnd
+  • a gen0/gen1 GC may run inside the 1st pause, between GCStart(BGC) and RestartEEBegin
+```
+
+**Payloads (verified against `ClrEtwAll.man` and the recordings; .NET 6+):**
+
+| Event (id, version) | Fields used | GC number? |
+|---|---|---|
+| `GCSuspendEEBegin` (9, v1) | `Reason` u32 (1 = SuspendForGC, 6 = SuspendForGCPrep, others ignored), `Count` u32 | only for GCPrep (`Count` = the BGC's number); for SuspendForGC it is the previous GC's number |
+| `GCStart` (1, v2) | `Count`, `Depth` (generation), `Reason` (`gc_reason`, `gc.h`, 0–17), `Type` (0 blocking, 1 background, 2 foreground) | yes |
+| `GCGlobalHeapHistory` (205, v4) | `GlobalMechanisms` bit 0 = concurrent, bit 1 = compaction | no (its `Count` is the length of the `Times` array); comes right before the GC's `GCEnd` on the same thread |
+| `GCEnd` (2, v1) | `Count`, `Depth` | yes |
+| `GCHeapStats` (4, v2) | `GenerationSize0..4` and `TotalPromotedSize0..4` (gen0, gen1, gen2, LOH, POH), finalization-promoted count, pinned objects, GC handles | no |
+| `GCRestartEEEnd` (3, v1) | none (`ClrInstanceID` only) | no |
+
+Longer payloads are accepted (newer versions append fields); unknown (id, version) pairs are skipped and counted.
+
+**Values (Maoni, GC ETW Events – 3 and 4):**
+- **Pause** = `RestartEEEnd − SuspendEE` per pause, summed over the GC's pauses (two for a background GC). An upper bound: some threads run during suspension and resumption.
+- **Duration** = `GCEnd − GCStart`. For a background GC, duration ≫ pause.
+- **Generation sizes** are measured at the end of the GC and include fragmentation. A background GC never compacts, so gen2 fragmentation grows after BGCs; a compacting blocking gen2 clears it.
+
+**Correlation without sorting** (implemented in `wolf-dotnet` `GcCorrelator`, P1-4). Events are only in order within one thread (§3.1), and `RestartEEEnd`, `GCGlobalHeapHistory` and `GCHeapStats` carry no GC number. The runtime guarantees that the thread that suspends for a pause also restarts it, and that `GCHeapStats` directly follows `GCEnd` on the same thread. Two small maps follow from this:
+
+| | `gcs` | `threads` |
+|---|---|---|
+| Key | GC number | thread id |
+| Value | the GC being assembled: generation, reason, type, compacting, sizes, start/end, summed pause, pauses closed | open pause (start, GC number once known); last GC ended on this thread |
+| Purpose | collect one GC's parts from different events and threads, in any order | give a GC number to events that have none |
+| Created / deleted | by the first event for that number / when complete and emitted | at SuspendEE or GCEnd / when both fields are empty |
+| Typical size | 1–2 (a BGC in progress plus the current blocking GC) | 0–1 (the runtime allows one suspension at a time) |
+
+Rules (event on thread T):
+- `SuspendEE(GC)` → `threads[T]` opens a pause, GC number unknown. `SuspendEE(GCPrep, n)` → opens a pause for #n.
+- `GCStart #n` → fills `gcs[n]`; T's open pause gets number n if it has none.
+- `GCGlobalHeapHistory` → `threads[T]` keeps the compaction flag for T's next `GCEnd`. `GCEnd #n` → `gcs[n]` end and compaction flag; `threads[T]` remembers n.
+- `GCHeapStats` → sizes of the GC that T just ended. `RestartEEEnd` → adds the pause to T's GC.
+- A record is complete with start, end and sizes plus one pause (blocking, foreground) or two (background); then it is emitted and deleted.
+- A pause shared by a starting BGC and an ephemeral GC (seen in every BGC of the `SteadyAllocator` recording): as in TraceEvent, the BGC gets the suspension (`SuspendEE` → `SuspendEEEnd`), the ephemeral GC the time from its own `GCStart` to `RestartEEEnd`.
+- Cleanup for missing events (drops, attach mid-GC, session stop): an entry older than 60 s (10 min for a background GC), measured against the newest GC event's timestamp, is deleted and counted; a new SuspendEE on a thread replaces its stale pause. Not a GC count: with frequent gen0 GCs, many GCs can complete within one stretch of reordered events, and a background GC outlives many foreground GCs. 60 s is far beyond the reordering, which is bounded by how often the runtime writes its buffers.
+- **Tests:** `crates/wolf-dotnet/tests/golden_gc.rs` must match `testdata/nettrace/<name>.gc.expected.txt`, written by `tools/TraceCheck` in gc mode from TraceEvent's GC model (PerfView GCStats): number, generation, type, reason, compaction and sizes exactly, pause and duration within 0.001 ms. It also regroups events by thread in windows of 7, 64 and 1000 events and must get the same GCs.
 
 **Aggregation (volume control):**
 - gen1 and gen2 GCs → one full `dotnet.gc` event each.
@@ -124,7 +171,7 @@ Events:
 
 | Kind | Data |
 |---|---|
-| `dotnet.gc` | gc_number, generation, reason, type, pause_ms, compacting? |
+| `dotnet.gc` | gc_number, generation, reason, type, pause_ms, duration_ms, compacting |
 | `dotnet.gc.gen0.summary` | count, total_pause_ms, max_pause_ms |
 | `dotnet.snapshot.started` / `.finished` / `.failed` | command_id, artifact, objects, size, pause_ms, error |
 | `target.attached` / `target.detached` | metadata / reason |
