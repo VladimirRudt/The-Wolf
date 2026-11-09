@@ -5,6 +5,7 @@
 use wolf_nettrace::Event;
 
 use crate::gc::{GcKind, GcReason, HeapStats};
+use crate::events_decoding::{Decoded};
 
 const RUNTIME_PROVIDER: &str = "Microsoft-Windows-DotNETRuntime";
 
@@ -39,16 +40,7 @@ pub(crate) enum GcEvent {
     RestartEnd,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Decoded {
-    /// Some other event; not counted.
-    Other,
-    Gc(GcEvent),
-    /// A GC event we use, in a version or size we can't read.
-    Unreadable,
-}
-
-pub(crate) fn decode(event: &Event<'_>) -> Decoded {
+pub(crate) fn decode_gc_event(event: &Event<'_>) -> Decoded<GcEvent> {
     let metadata = event.metadata;
     if metadata.provider != RUNTIME_PROVIDER {
         return Decoded::Other;
@@ -56,7 +48,7 @@ pub(crate) fn decode(event: &Event<'_>) -> Decoded {
     decode_payload(metadata.event_id, metadata.version, event.payload)
 }
 
-fn decode_payload(event_id: u32, version: u32, payload: &[u8]) -> Decoded {
+fn decode_payload(event_id: u32, version: u32, payload: &[u8]) -> Decoded<GcEvent> {
     let payload_object = Payload(payload);
     let decoded = match event_id {
         // GCSuspendEEBegin_V1: Reason, Count.
@@ -86,7 +78,7 @@ fn decode_payload(event_id: u32, version: u32, payload: &[u8]) -> Decoded {
         9 | 1 | 205 | 2 | 4 => None,
         _ => return Decoded::Other,
     };
-    decoded.map_or(Decoded::Unreadable, Decoded::Gc)
+    decoded.map_or(Decoded::Unreadable, |gc| Decoded::Value(gc))
 }
 
 /// `GCHeapStats_V2`: size and promoted bytes for gen0, gen1, gen2, LOH (`GenerationSize3`),
@@ -133,14 +125,14 @@ mod tests {
         // GC #40 of steady-gc-counters-net10-windows-x64 (payload hex from its .expected.txt).
         assert_eq!(
             decode_payload(9, 1, &hex("01000000270000000a00")),
-            Decoded::Gc(GcEvent::SuspendBegin {
+            Decoded::Value(GcEvent::SuspendBegin {
                 reason: 1, // SuspendForGC
                 count: 39
             })
         );
         assert_eq!(
             decode_payload(1, 2, &hex("28000000010000000000000000000000")),
-            Decoded::Gc(GcEvent::Start {
+            Decoded::Value(GcEvent::Start {
                 number: 40,
                 generation: 1,
                 reason: GcReason(0),
@@ -149,11 +141,11 @@ mod tests {
         );
         assert_eq!(
             decode_payload(2, 1, &hex("28000000010000000a00")),
-            Decoded::Gc(GcEvent::End { number: 40 })
+            Decoded::Value(GcEvent::End { number: 40 })
         );
         assert_eq!(
             decode_payload(3, 1, &hex("0a00")),
-            Decoded::Gc(GcEvent::RestartEnd)
+            Decoded::Value(GcEvent::RestartEnd)
         );
     }
 
@@ -171,7 +163,7 @@ mod tests {
         payload.extend_from_slice(&15u64.to_le_bytes()); // POH promoted
         assert_eq!(payload.len(), 110);
 
-        let Decoded::Gc(GcEvent::HeapStats(stats)) = decode_payload(4, 2, &payload) else {
+        let Decoded::Value(GcEvent::HeapStats(stats)) = decode_payload(4, 2, &payload) else {
             panic!("not heap stats");
         };
         assert_eq!(stats.size, [1, 3, 5, 7, 14]);
@@ -194,7 +186,7 @@ mod tests {
         payload.extend_from_slice(&[0xFF; 20]);
         assert!(matches!(
             decode_payload(1, 3, &payload),
-            Decoded::Gc(GcEvent::Start { number: 40, .. })
+            Decoded::Value(GcEvent::Start { number: 40, .. })
         ));
     }
 }

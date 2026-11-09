@@ -97,7 +97,7 @@ impl GcCorrelator {
     /// Feeds one parsed event; non-GC events are ignored. Calls `on_gc` for each GC this event
     /// completes.
     pub fn on_event(&mut self, event: &Event<'_>, on_gc: &mut impl FnMut(GcCompleted)) {
-        match gc_events::decode(event) {
+        match gc_events::decode_gc_event(event) {
             Decoded::Other => {}
             Decoded::Unreadable => self.stats.unreadable_events += 1,
             Decoded::Gc(gc_event) => {
