@@ -9,6 +9,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+crossbeam-queue.workspace = true
 serde_json.workspace = true
 wolf-contract.workspace = true
 wolf-nettrace.workspace = true

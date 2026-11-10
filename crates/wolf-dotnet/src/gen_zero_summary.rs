@@ -26,9 +26,9 @@ pub struct Gen0Summary {
 pub fn add_gen0(
     pending: &mut Option<Gen0Summary>,
     gc: GcCompleted,
-    on_summary: &mut impl FnMut(Gen0Summary)) {
-    let summary = pending.get_or_insert(Gen0Summary
-    {
+    on_summary: &mut impl FnMut(Gen0Summary),
+) {
+    let summary = pending.get_or_insert(Gen0Summary {
         start_utc_ns: gc.start_utc_ns,
         end_utc_ns: gc.end_utc_ns,
         count: 0,
@@ -46,7 +46,8 @@ pub fn add_gen0(
     summary.max_pause_ns = summary.max_pause_ns.max(gc.pause_ns);
 
     if summary.end_utc_ns - summary.start_utc_ns >= GEN0_SUMMARY_NS
-       && let Some(some_summary) = pending.take()  {
+        && let Some(some_summary) = pending.take()
+    {
         on_summary(some_summary)
     }
 }

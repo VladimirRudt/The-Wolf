@@ -4,8 +4,8 @@
 
 use wolf_nettrace::Event;
 
+use crate::events_decoding::Decoded;
 use crate::gc::{GcKind, GcReason, HeapStats};
-use crate::events_decoding::{Decoded};
 
 const RUNTIME_PROVIDER: &str = "Microsoft-Windows-DotNETRuntime";
 
@@ -68,9 +68,13 @@ fn decode_payload(event_id: u32, version: u32, payload: &[u8]) -> Decoded<GcEven
         })(),
         // GCGlobalHeapHistory_V4: GlobalMechanisms at 24 (bit 0 = concurrent, bit 1 =
         // compaction). Its `Count` (at 46) is the length of the `Times` array, not the GC number.
-        205 if version >= 4 => payload_object.u32(24).map(|mechanisms| GcEvent::GlobalHeapHistory {
-            compacting: mechanisms & 0b10 != 0,
-        }),
+        205 if version >= 4 => {
+            payload_object
+                .u32(24)
+                .map(|mechanisms| GcEvent::GlobalHeapHistory {
+                    compacting: mechanisms & 0b10 != 0,
+                })
+        }
         // GCEnd_V1: Count, Depth.
         2 if version >= 1 => payload_object.u32(0).map(|number| GcEvent::End { number }),
         4 if version >= 2 => heap_stats(payload_object).map(GcEvent::HeapStats),

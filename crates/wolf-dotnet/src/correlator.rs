@@ -10,8 +10,9 @@ use std::collections::HashMap;
 
 use wolf_nettrace::{Event, TraceInfo};
 
+use crate::events_decoding::Decoded;
 use crate::gc::{GcCompleted, GcKind, GcReason, HeapStats};
-use crate::gc_events::{self, Decoded, GcEvent, SUSPEND_FOR_GC_PREP};
+use crate::gc_events::{self, GcEvent, SUSPEND_FOR_GC_PREP};
 
 /// An entry still incomplete this long after it was created (by the newest GC event's
 /// timestamp) lost its other events (drops, attach mid-GC) and is removed. Far beyond the
@@ -100,7 +101,7 @@ impl GcCorrelator {
         match gc_events::decode_gc_event(event) {
             Decoded::Other => {}
             Decoded::Unreadable => self.stats.unreadable_events += 1,
-            Decoded::Gc(gc_event) => {
+            Decoded::Value(gc_event) => {
                 self.on_gc_event(
                     event.thread_id,
                     event.timestamp,
