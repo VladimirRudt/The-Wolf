@@ -25,4 +25,4 @@ pub use correlator::{CorrelatorStats, GcCorrelator};
 pub use ec_events::{CounterType, EcEvent, EcString, EcStringPool, decode_counter};
 pub use events_decoding::Decoded;
 pub use gc::{GENERATIONS, GcCompleted, GcKind, GcReason, HeapStats};
-pub use gen_zero_summary::Gen0Summary;
+pub use gen_zero_summary::{Gen0Summary, add_gen0};

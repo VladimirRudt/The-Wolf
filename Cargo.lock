@@ -257,6 +257,11 @@ dependencies = [
 [[package]]
 name = "wolf-process"
 version = "0.1.0"
+dependencies = [
+ "libc",
+ "windows-sys",
+ "wolf-contract",
+]
 
 [[package]]
 name = "wolf-storage"

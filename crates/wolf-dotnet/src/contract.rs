@@ -86,14 +86,16 @@ impl GcSeries {
         unit: Unit,
     ) -> SeriesDescriptor {
         let labels = BTreeMap::from([("generation".to_owned(), generation.to_owned())]);
-        let descriptor = SeriesDescriptor::new(target_id.clone(), metric, labels, unit);
-        descriptor
+        SeriesDescriptor::new(target_id.clone(), metric, labels, unit)
     }
 
     fn series(target_id: &TargetId, metric: &str, unit: Unit) -> SeriesDescriptor {
-        let labels = BTreeMap::new();
-        let descriptor = SeriesDescriptor::new(target_id.clone(), metric, labels, unit);
-        descriptor
+        SeriesDescriptor::new(target_id.clone(), metric, BTreeMap::new(), unit)
+    }
+
+    /// The series ids to pass to [`ContractMapper::to_points`].
+    pub fn ids(&self) -> &GcSeriesIds {
+        &self.ids
     }
 
     /// Descriptors to register with storage before the first point.

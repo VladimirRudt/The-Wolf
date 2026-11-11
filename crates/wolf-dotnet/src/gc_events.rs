@@ -82,7 +82,7 @@ fn decode_payload(event_id: u32, version: u32, payload: &[u8]) -> Decoded<GcEven
         9 | 1 | 205 | 2 | 4 => None,
         _ => return Decoded::Other,
     };
-    decoded.map_or(Decoded::Unreadable, |gc| Decoded::Value(gc))
+    decoded.map_or(Decoded::Unreadable, Decoded::Value)
 }
 
 /// `GCHeapStats_V2`: size and promoted bytes for gen0, gen1, gen2, LOH (`GenerationSize3`),
