@@ -10,7 +10,7 @@ const RSS: &str = "process.memory.rss";
 const PRIVATE: &str = "process.memory.private";
 const VIRTUAL: &str = "process.memory.virtual";
 const LIMIT: &str = "process.memory.limit";
-const THREADS: &str = "process.memory.threads";
+const THREADS: &str = "process.threads";
 
 /// The five process series of one target, created once at attach.
 #[derive(Debug, Clone)]

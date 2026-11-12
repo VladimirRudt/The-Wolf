@@ -130,7 +130,7 @@ Rules:
 ### 4.1 Time-series layout and retention (DuckDB)
 
 - Tables: `series` (one row per `SeriesDescriptor`) and `points (series_id, ts_utc_ns, value)`. Points arrive in time order, so all series are interleaved within each row group (~122,880 rows). Queries skip row groups by `ts` (zone maps) but not by `series_id`; with ~30 series that means reading up to ~30× the needed rows — well under a millisecond at our volume. It only matters with thousands of series per table (see the label rule in §3.2).
-- No index on `series_id`: it slows inserts and zone maps already do the skipping.
+- No index on `series_id`: it slows inserts and zone maps already do the skipping. Constraints in general live only where they are cheap: `series.target` references `targets.id` and `points_1m` is `PRIMARY KEY (series_id, minute)` (one row per bucket, enforced). The append-hot `points` and `events` tables stay keyless — the single writer keeps their references valid and any index would tax every inserted row.
 - DuckDB is an embedded library with no scheduler or built-in retention. The retention job is ours: a background task in `wolf-host` (the single writer) that, in one transaction, downsamples raw points older than the full-resolution window into `points_1m` and deletes them.
 - `points_1m` keeps `min`, `max`, `avg` and `last` per series per minute: `max` keeps spikes, `min` keeps the sawtooth bottoms (the leak signal, §5), `last` suits step series (gen1/gen2 size after each GC).
 - The job writes `points_1m` ordered by `(series_id, minute)`, so long-term data is grouped by series and queries can skip by `series_id` too.
