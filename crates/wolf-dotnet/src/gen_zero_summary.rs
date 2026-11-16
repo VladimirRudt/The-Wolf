@@ -1,5 +1,5 @@
 //! The GC part of a telemetry session: correlation, then volume control
-//! (`docs/collector-dotnet.md` §3.2 "Aggregation"). Runs on the session's reader thread.
+//! (`docs/collector-dotnet.md` §3.2 "Aggregation"). Runs on the session source's thread.
 
 use crate::gc::{GcCompleted, HeapStats};
 

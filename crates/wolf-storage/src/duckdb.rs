@@ -120,7 +120,7 @@ impl Default for Config {
 /// the store, cleared per row, reused across every batch — after the first batches these
 /// hold steady-state capacity and inserts allocate nothing.
 #[derive(Debug, Default)]
-struct Scratch {
+pub(crate) struct Scratch {
     target: String,
     json: Vec<u8>,
 }
@@ -128,7 +128,7 @@ struct Scratch {
 impl Scratch {
     /// Re-serialize `target` and `payload`, then hand out the borrowed pair for one
     /// appender row. The borrows end with the row; the capacity stays.
-    fn row<'a>(
+    pub(crate) fn row<'a>(
         &'a mut self,
         target: &TargetId,
         payload: &impl serde::Serialize,
@@ -144,7 +144,7 @@ impl Scratch {
     }
 
     /// Drop excess capacity after a batch (see [`MAX_SCRATCH_BYTES`]).
-    fn release_burst(&mut self) {
+    pub(crate) fn release_burst(&mut self) {
         if self.json.capacity() > MAX_SCRATCH_BYTES {
             self.json = Vec::new();
         }
@@ -451,7 +451,7 @@ impl Storage for DuckDbStore {
 
 /// Serializes a unit to its catalogue string (`"bytes"`, `"count"`, …; unknown units as
 /// their raw text). Reuses the contract's serde rules so storage and wire agree.
-fn unit_text(unit: &Unit) -> Result<String> {
+pub(crate) fn unit_text(unit: &Unit) -> Result<String> {
     let value = serde_json::to_value(unit)?;
     value
         .as_str()

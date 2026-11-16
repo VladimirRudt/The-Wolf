@@ -127,14 +127,25 @@ Rules:
 
 **Why telemetry is persisted.** Investigation happens after the fact (a rule fires at 03:14, the LLM is asked in the morning). Snapshots answer *what* is in memory and *why* it is alive; stored telemetry answers *when* and *how fast*: when growth started, whether sawtooth bottoms rise, managed vs native, memory around each snapshot marker, before vs after a fix. The live chart and rules work on recent data and use the in-memory ring buffer.
 
-### 4.1 Time-series layout and retention (DuckDB)
+### 4.1 Sharded, time-segmented layout (DuckDB)
 
-- Tables: `series` (one row per `SeriesDescriptor`) and `points (series_id, ts_utc_ns, value)`. Points arrive in time order, so all series are interleaved within each row group (~122,880 rows). Queries skip row groups by `ts` (zone maps) but not by `series_id`; with ~30 series that means reading up to ~30× the needed rows — well under a millisecond at our volume. It only matters with thousands of series per table (see the label rule in §3.2).
-- No index on `series_id`: it slows inserts and zone maps already do the skipping. Constraints in general live only where they are cheap: `series.target` references `targets.id` and `points_1m` is `PRIMARY KEY (series_id, minute)` (one row per bucket, enforced). The append-hot `points` and `events` tables stay keyless — the single writer keeps their references valid and any index would tax every inserted row.
-- DuckDB is an embedded library with no scheduler or built-in retention. The retention job is ours: a background task in `wolf-host` (the single writer) that, in one transaction, downsamples raw points older than the full-resolution window into `points_1m` and deletes them.
+The store is a directory, not a file. Each physical shard (one pipeline thread, D14) owns a `shard-NN/` subdirectory and is the single writer of its files:
+
+```
+<db-dir>/shard-00/
+  meta.duckdb            — targets, series, events, wolf_meta (small, kept indefinitely)
+  longterm.duckdb        — points_1m (downsampled history)
+  seg-YYYY-MM-DD.duckdb  — raw points of one UTC day
+```
+
+- One DuckDB connection per shard; `meta` is the primary catalog, segments and `longterm` are ATTACHed. Writes to a segment go to the file of the point's UTC day; midnight-straddling flushes split across two segments.
+- Tables: `series` (one row per `SeriesDescriptor`) and `points (series_id, ts_utc_ns, value)` in the segments. Points arrive in time order, so all series are interleaved within each row group (~122,880 rows). Queries skip row groups by `ts` (zone maps) but not by `series_id`; with ~30 series that means reading up to ~30× the needed rows — well under a millisecond at our volume. It only matters with thousands of series per table (see the label rule in §3.2).
+- No index on `series_id`: it slows inserts and zone maps already do the skipping. Constraints in general live only where they are cheap: `series.target` references `targets.id` and `points_1m` is `PRIMARY KEY (series_id, minute)` (one row per bucket, enforced). The append-hot `points` and `events` tables stay keyless — the single writer per shard keeps their references valid and any index would tax every inserted row.
+- **Retention is a file drop, not a DELETE.** Each pipeline retires its own sealed day-segments on a cadence: downsample the segment into `longterm.points_1m` (idempotent anti-join — a crash between downsample and removal is safe to re-run), then remove the file. No delete ever runs against the raw table, so retention never competes with the write path. Retention granularity is one UTC day; the partially covered current day stays raw.
 - `points_1m` keeps `min`, `max`, `avg` and `last` per series per minute: `max` keeps spikes, `min` keeps the sawtooth bottoms (the leak signal, §5), `last` suits step series (gen1/gen2 size after each GC).
-- The job writes `points_1m` ordered by `(series_id, minute)`, so long-term data is grouped by series and queries can skip by `series_id` too.
-- Deleted rows free space inside the file for reuse; the file does not shrink.
+- Events live in `meta.duckdb`, not in segments: lifecycle markers stay available after raw points age out.
+- Reads across shards go through a **query layer** (`QueryStore`): an in-memory connection that ATTACHes every shard's files read-only and unions them. DuckDB allows either one writer or many readers, so the query layer is used after the host stops or against a copy until the MCP server (P4) brokers live reads.
+- Deleted rows free space inside a file for reuse; files never shrink — but segments are deleted whole, so raw retention reclaims disk for real.
 
 ---
 
@@ -172,7 +183,8 @@ gen 0                   ┘
 | D10 | Privacy by default: no string contents/field values in snapshots unless opted in | Heaps contain secrets/PII |
 | D11 | Collector self-telemetry (own overhead, dropped events) | Distinguish "app slow" from "Mr. Wolf made it slow" |
 | D12 | .NET 6+ targets only (EventPipe requires .NET Core 3.0+) | Modern runtimes |
-| D13 | **Data collection path is hand-written, blocking std I/O on one plain thread per session** (`EventSession::read_chunk`); tokio only for request/response commands and the rest of the host. No actor or streaming frameworks in the collection path | Critical path: full control over threads, buffering and ordering; backpressure is explicit (runtime buffer → pipe → reader thread → bounded `std::sync::mpsc`) |
+| D13 | **Data collection path is hand-written, blocking std I/O on one plain thread per session** (`EventSession::read_chunk`); tokio only for request/response commands and the rest of the host. No actor or streaming frameworks in the collection path | Critical path: full control over threads, buffering and ordering; backpressure is explicit (runtime buffer → pipe → source thread → bounded ring channel) |
+| D14 | **Sharded pipelines with fixed logical shards.** One pipeline thread per physical shard (default 4), each the single writer of its own store files; targets placed by `FNV-1a(target_id) % 256` logical buckets → `% N` physical shards. Raw points live in one file per UTC day per shard; retention downsamples a sealed day into `longterm.points_1m` and drops the file. Cross-shard reads union all files (`QueryStore`) | The shard is the unit of parallelism, ordering and failover: scaling is more pipelines (or hosts, later) remapping whole buckets, never many writers to one file. Drop-file retention never competes with inserts. Stage names follow streaming vocabulary: sources → channels → pipeline (transform + sink) |
 
 ---
 

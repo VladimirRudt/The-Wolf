@@ -1,13 +1,19 @@
-//! The router actor over an in-memory store: message mapping, batching, lifecycle events,
-//! self-telemetry. (Mailbox behaviour itself is unit-tested in `mailbox.rs`.)
+//! The pipeline actor over an in-memory shard store: record mapping, batching, lifecycle
+//! events, self-telemetry. (Channel behaviour itself is unit-tested in `channel.rs`,
+//! placement in `placement.rs`.)
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use wolf_contract::{TargetId, Timestamp};
 use wolf_dotnet::{DotnetTelemetry, EcSeries, GcKind, GcReason, GcSeries, HeapStats};
-use wolf_host::{Input, Router, SelfTelemetry, SessionEnd, SessionItem, Wakeup};
+use wolf_host::{
+    Pipeline, PipelineConfig, Record, SelfTelemetry, SessionEnd, SessionItem, SourceStatsSnapshot,
+    Wakeup,
+};
 use wolf_process::{ProcessSample, ProcessSeries};
-use wolf_storage::{DuckDbStore, Storage};
+use wolf_storage::{ShardStore, Storage};
 
 const BASE_NS: i64 = 1_760_843_645_000_000_000;
 
@@ -37,21 +43,28 @@ fn gc_completed(generation: u32) -> wolf_dotnet::GcCompleted {
     }
 }
 
-fn router_with_target() -> (Router<DuckDbStore>, u32) {
-    let store = DuckDbStore::open_in_memory().expect("store");
+fn pipeline_with_target() -> (Pipeline<ShardStore>, u32, wolf_host::TargetFlags) {
+    let store = ShardStore::open_in_memory().expect("store");
     let wakeup = Arc::new(Wakeup::default());
-    let mut router = Router::new(store, wakeup);
+    let mut pipeline = Pipeline::new(
+        store,
+        wakeup,
+        PipelineConfig {
+            flush_interval: Duration::from_secs(1),
+            retention: None,
+        },
+    );
     let id = target();
-    let slot = router
-        .add_target(
+    let (slot, flags) = pipeline
+        .attach(
             id.clone(),
             ts(BASE_NS),
             GcSeries::new(id.clone()),
             EcSeries::new(id.clone()),
             ProcessSeries::new(id),
         )
-        .expect("add target");
-    (router, slot)
+        .expect("attach");
+    (pipeline, slot, flags)
 }
 
 fn sample() -> ProcessSample {
@@ -66,27 +79,28 @@ fn sample() -> ProcessSample {
 
 #[test]
 fn telemetry_and_samples_batch_into_storage() {
-    let (mut router, slot) = router_with_target();
-    router.on_message(
+    let (mut pipeline, slot, _flags) = pipeline_with_target();
+    pipeline.on_record(
         slot,
-        Input::Session(SessionItem::Telemetry(DotnetTelemetry::Gc(gc_completed(2)))),
+        Record::Session(SessionItem::Telemetry(DotnetTelemetry::Gc(gc_completed(2)))),
     );
-    router.on_message(
+    pipeline.on_record(
         slot,
-        Input::Sample {
+        Record::Sample {
             ts: ts(BASE_NS + 2_000_000),
             sample: sample(),
         },
     );
-    router.flush().expect("flush");
+    pipeline.flush().expect("flush");
 
-    assert_eq!(router.stats().points_written, 13 + 5);
-    assert_eq!(router.stats().events_written, 1);
-    assert_eq!(router.stats().batches, 1);
+    let stats = pipeline.stats().snapshot();
+    assert_eq!(stats.points_written, 13 + 5);
+    assert_eq!(stats.events_written, 1);
+    assert_eq!(stats.batches, 1);
 
     // The GC event landed with its catalogue name and payload.
     let id = target();
-    let events = router
+    let events = pipeline
         .store()
         .events(&id, ts(0)..ts(i64::MAX))
         .expect("events");
@@ -100,7 +114,7 @@ fn telemetry_and_samples_batch_into_storage() {
     let gen2 = gc_series.descriptors()[2].clone();
     assert_eq!(gen2.metric(), "dotnet.gc.heap.size");
     assert_eq!(
-        router
+        pipeline
             .store()
             .points(gen2.id(), ts(0)..ts(i64::MAX))
             .expect("points"),
@@ -114,17 +128,16 @@ fn telemetry_and_samples_batch_into_storage() {
 
 #[test]
 fn stream_end_detaches_the_target_with_a_reason() {
-    let (mut router, slot) = router_with_target();
-    router.on_message(
+    let (mut pipeline, slot, flags) = pipeline_with_target();
+    pipeline.on_record(
         slot,
-        Input::Session(SessionItem::Ended(SessionEnd::StreamClosed)),
+        Record::Session(SessionItem::Ended(SessionEnd::StreamClosed)),
     );
-    assert!(router.is_detached(slot));
-    assert_eq!(router.detached_count(), 1);
-    router.flush().expect("flush");
+    assert!(flags.detached.load(Ordering::Relaxed));
+    pipeline.flush().expect("flush");
 
     let id = target();
-    let events = router
+    let events = pipeline
         .store()
         .events(&id, ts(0)..ts(i64::MAX))
         .expect("events");
@@ -133,14 +146,14 @@ fn stream_end_detaches_the_target_with_a_reason() {
     assert_eq!(events[0].data["reason"], serde_json::json!("exited"));
 
     // A stop requested by the host reports "stopped" instead of "exited".
-    let (mut router2, slot2) = router_with_target();
-    router2.begin_detach(slot2);
-    router2.on_message(
+    let (mut pipeline2, slot2, flags2) = pipeline_with_target();
+    flags2.detaching.store(true, Ordering::Relaxed);
+    pipeline2.on_record(
         slot2,
-        Input::Session(SessionItem::Ended(SessionEnd::StreamClosed)),
+        Record::Session(SessionItem::Ended(SessionEnd::StreamClosed)),
     );
-    router2.flush().expect("flush");
-    let events = router2
+    pipeline2.flush().expect("flush");
+    let events = pipeline2
         .store()
         .events(&id, ts(0)..ts(i64::MAX))
         .expect("events");
@@ -149,17 +162,17 @@ fn stream_end_detaches_the_target_with_a_reason() {
 
 #[test]
 fn a_stream_error_records_session_lost_and_detached() {
-    let (mut router, slot) = router_with_target();
+    let (mut pipeline, slot, flags) = pipeline_with_target();
     let error = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "pipe broke");
-    router.on_message(
+    pipeline.on_record(
         slot,
-        Input::Session(SessionItem::Ended(SessionEnd::Io(error))),
+        Record::Session(SessionItem::Ended(SessionEnd::Io(error))),
     );
-    assert!(router.is_detached(slot));
-    router.flush().expect("flush");
+    assert!(flags.detached.load(Ordering::Relaxed));
+    pipeline.flush().expect("flush");
 
     let id = target();
-    let events = router
+    let events = pipeline
         .store()
         .events(&id, ts(0)..ts(i64::MAX))
         .expect("events");
@@ -176,34 +189,48 @@ fn a_stream_error_records_session_lost_and_detached() {
 
 #[test]
 fn self_telemetry_reports_wolf_series() {
-    let store = DuckDbStore::open_in_memory().expect("store");
+    let store = ShardStore::open_in_memory().expect("store");
     let wakeup = Arc::new(Wakeup::default());
-    let mut router = Router::new(store, wakeup);
+    let mut pipeline = Pipeline::new(
+        store,
+        wakeup,
+        PipelineConfig {
+            flush_interval: Duration::from_secs(1),
+            retention: None,
+        },
+    );
     let host = TargetId::new(1, 1_760_843_645, "srv-a").expect("host target");
     let telemetry = SelfTelemetry::new(host.clone());
     let events_received = telemetry.descriptors()[0].id();
     let events_dropped = telemetry.descriptors()[1].id();
-    router
+    pipeline
         .register_self(telemetry, ts(BASE_NS))
         .expect("register self");
 
-    let totals = wolf_host::ReaderStatsSnapshot {
+    let totals = SourceStatsSnapshot {
         events: 42,
         dropped: 1,
         bytes: 4096,
         ..Default::default()
     };
-    router.self_report(ts(BASE_NS + 1_000), &totals);
-    router.flush().expect("flush");
-    assert_eq!(router.stats().points_written, 4);
+    pipeline.on_record(
+        0,
+        Record::SelfReport {
+            ts: ts(BASE_NS + 1_000),
+            totals,
+            rss: 1_000_000,
+        },
+    );
+    pipeline.flush().expect("flush");
+    assert_eq!(pipeline.stats().snapshot().points_written, 4);
 
-    let received = router
+    let received = pipeline
         .store()
         .points(events_received, ts(0)..ts(i64::MAX))
         .expect("received points");
     assert_eq!(received.len(), 1);
     assert_eq!(received[0].value, 42.0);
-    let dropped = router
+    let dropped = pipeline
         .store()
         .points(events_dropped, ts(0)..ts(i64::MAX))
         .expect("dropped points");
@@ -211,7 +238,7 @@ fn self_telemetry_reports_wolf_series() {
 
     // The host registered itself as a target.
     assert_eq!(
-        router.store().targets().expect("targets"),
+        pipeline.store().targets().expect("targets"),
         [wolf_storage::TargetInfo {
             id: host,
             first_seen: ts(BASE_NS),

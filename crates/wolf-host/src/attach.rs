@@ -24,7 +24,7 @@ pub fn telemetry_session_config() -> SessionConfig {
     ])
 }
 
-/// One attached target, before its session starts: everything the router and the host
+/// One attached target, before its session starts: everything the pipeline and the host
 /// need later.
 #[derive(Debug)]
 pub struct Attached {

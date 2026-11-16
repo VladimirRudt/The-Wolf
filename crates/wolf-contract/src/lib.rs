@@ -16,6 +16,7 @@ mod target;
 mod telemetry;
 
 pub use command::{ArtifactRef, CollectorInfo, Command, CommandId, CommandResult, CommandStatus};
+pub use fnv::Fnv1a;
 pub use target::{ParseTargetIdError, TargetId};
 pub use telemetry::{Event, Point, SeriesDescriptor, SeriesId, Timestamp, Unit};
 

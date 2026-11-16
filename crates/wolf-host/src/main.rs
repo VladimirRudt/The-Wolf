@@ -1,5 +1,6 @@
-//! `mrwolf [--db PATH] <pid>...` — attach to running .NET processes and collect until
-//! ctrl-c. Thin: argument parsing and the final report; the logic is in the library.
+//! `mrwolf [--db DIR] [--shards N] <pid>...` — attach to running .NET processes and
+//! collect until ctrl-c. Thin: argument parsing and the final report; the logic is in
+//! the library.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -15,7 +16,13 @@ fn main() -> ExitCode {
                 let Some(path) = args.next() else {
                     return usage();
                 };
-                config.db_path = PathBuf::from(path);
+                config.db_dir = PathBuf::from(path);
+            }
+            "--shards" => {
+                let Some(shards) = args.next().and_then(|s| s.parse::<u16>().ok()) else {
+                    return usage();
+                };
+                config.shards = shards;
             }
             "--help" | "-h" => {
                 usage();
@@ -43,11 +50,11 @@ fn main() -> ExitCode {
                 report.uptime,
                 report.attached,
                 report.detached,
-                report.readers.events,
-                report.readers.dropped,
-                report.readers.bytes,
-                report.router.points_written,
-                report.router.events_written,
+                report.sources.events,
+                report.sources.dropped,
+                report.sources.bytes,
+                report.pipelines.points_written,
+                report.pipelines.events_written,
                 report.sample_errors,
             );
             ExitCode::SUCCESS
@@ -62,9 +69,10 @@ fn main() -> ExitCode {
 fn usage() -> ExitCode {
     eprintln!(
         "mrwolf {} — attach to running .NET processes and store their telemetry\n\
-         usage: mrwolf [--db <path>] <pid>...\n\
+         usage: mrwolf [--db <dir>] [--shards <n>] <pid>...\n\
          \n\
-         --db <path>   store file (default: wolf.duckdb)\n\
+         --db <dir>    store directory with one shard-NN/ per pipeline (default: wolf.db)\n\
+         --shards <n>  pipeline threads / physical shards (default: 4)\n\
          <pid>...      pids of .NET processes to watch; stop with ctrl-c",
         env!("CARGO_PKG_VERSION")
     );

@@ -1,12 +1,13 @@
-//! The session reader actor (D13): blocking reads straight into the nettrace parser's
-//! buffer, GC correlation and counter decoding in place, results into its ring mailbox.
+//! The session source (D13): blocking reads straight into the nettrace parser's buffer,
+//! GC correlation and counter decoding in place, results into its ring channel. One
+//! thread per attached target.
 //!
 //! [`SessionDecoder`] holds all decoding state and is I/O-free, so tests can drive it
-//! with recorded streams; [`run_reader`] is the thin I/O loop around it.
+//! with recorded streams; [`run_session_source`] is the thin I/O loop around it.
 
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
 use wolf_contract::Timestamp;
 use wolf_dotnet::{
@@ -16,17 +17,18 @@ use wolf_dotnet::{
 use wolf_ipc::EventSession;
 use wolf_nettrace::{NettraceParser, ParseError};
 
-use crate::mailbox::Producer;
-use crate::messages::{Input, Message};
+use super::SourceStats;
+use crate::channel::Producer;
+use crate::record::{Message, Record};
 
-/// What a reader sends; the router maps it to contract points and events.
+/// What a session source sends; the transform maps it to contract points and events.
 #[derive(Debug)]
 pub enum SessionItem {
     /// A correlated GC (gen1/gen2) or a per-second gen0 summary.
     Telemetry(DotnetTelemetry),
     /// One `System.Runtime` counter sample; `ts` is the event time converted to UTC.
     Counter { ts: Timestamp, counter: EcEvent },
-    /// The stream ended; carries why. Always the last item of a reader.
+    /// The stream ended; carries why. Always the last item of a session source.
     Ended(SessionEnd),
 }
 
@@ -50,80 +52,6 @@ impl std::fmt::Display for SessionEnd {
     }
 }
 
-/// Cumulative reader-side counters, shared with the router (self-telemetry, D11).
-/// Written by the reader thread only; read once a minute.
-#[derive(Debug, Default)]
-pub struct ReaderStats {
-    pub bytes: AtomicU64,
-    /// Parser counters (`wolf_nettrace::Stats`), copied after every commit.
-    pub events: AtomicU64,
-    /// Events the runtime dropped, from sequence-number gaps.
-    pub dropped: AtomicU64,
-    pub unknown: AtomicU64,
-    pub skipped_blocks: AtomicU64,
-    /// Correlator counters (`wolf_dotnet::CorrelatorStats`).
-    pub gcs: AtomicU64,
-    pub unreadable_gc: AtomicU64,
-    pub stale: AtomicU64,
-    /// EventCounters payloads that matched neither layout.
-    pub unreadable_counters: AtomicU64,
-}
-
-impl ReaderStats {
-    fn set(slot: &AtomicU64, value: u64) {
-        slot.store(value, Ordering::Relaxed);
-    }
-
-    /// A consistent-enough copy for reporting (Relaxed; the reader updates in bursts).
-    pub fn snapshot(&self) -> ReaderStatsSnapshot {
-        let get = |slot: &AtomicU64| slot.load(Ordering::Relaxed);
-        ReaderStatsSnapshot {
-            bytes: get(&self.bytes),
-            events: get(&self.events),
-            dropped: get(&self.dropped),
-            unknown: get(&self.unknown),
-            skipped_blocks: get(&self.skipped_blocks),
-            gcs: get(&self.gcs),
-            unreadable_gc: get(&self.unreadable_gc),
-            stale: get(&self.stale),
-            unreadable_counters: get(&self.unreadable_counters),
-        }
-    }
-}
-
-/// Plain copy of [`ReaderStats`].
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct ReaderStatsSnapshot {
-    pub bytes: u64,
-    pub events: u64,
-    pub dropped: u64,
-    pub unknown: u64,
-    pub skipped_blocks: u64,
-    pub gcs: u64,
-    pub unreadable_gc: u64,
-    pub stale: u64,
-    pub unreadable_counters: u64,
-}
-
-impl ReaderStatsSnapshot {
-    /// Field-by-field sum over any number of readers.
-    pub fn total(snapshots: impl Iterator<Item = Self>) -> Self {
-        let mut total = Self::default();
-        for s in snapshots {
-            total.bytes += s.bytes;
-            total.events += s.events;
-            total.dropped += s.dropped;
-            total.unknown += s.unknown;
-            total.skipped_blocks += s.skipped_blocks;
-            total.gcs += s.gcs;
-            total.unreadable_gc += s.unreadable_gc;
-            total.stale += s.stale;
-            total.unreadable_counters += s.unreadable_counters;
-        }
-        total
-    }
-}
-
 /// All state of one session's decode path: parser, GC correlation, gen0 summary and the
 /// counter string pool. No I/O: feed bytes via [`Self::spare`] + [`Self::commit`].
 #[derive(Debug)]
@@ -132,11 +60,11 @@ pub struct SessionDecoder {
     correlator: GcCorrelator,
     gen0_pending: Option<Gen0Summary>,
     pool: EcStringPool,
-    stats: Arc<ReaderStats>,
+    stats: Arc<SourceStats>,
 }
 
 impl SessionDecoder {
-    pub fn new(stats: Arc<ReaderStats>) -> Self {
+    pub fn new(stats: Arc<SourceStats>) -> Self {
         Self {
             parser: NettraceParser::new(),
             correlator: GcCorrelator::new(),
@@ -211,28 +139,28 @@ impl SessionDecoder {
 
     fn sync_stats(&self) {
         let parser = self.parser.stats();
-        ReaderStats::set(&self.stats.events, parser.events);
-        ReaderStats::set(&self.stats.dropped, parser.dropped_events);
-        ReaderStats::set(&self.stats.unknown, parser.unknown_events);
-        ReaderStats::set(&self.stats.skipped_blocks, parser.skipped_blocks);
+        SourceStats::set(&self.stats.events, parser.events);
+        SourceStats::set(&self.stats.dropped, parser.dropped_events);
+        SourceStats::set(&self.stats.unknown, parser.unknown_events);
+        SourceStats::set(&self.stats.skipped_blocks, parser.skipped_blocks);
         let correlator = self.correlator.stats();
-        ReaderStats::set(&self.stats.gcs, correlator.gcs);
-        ReaderStats::set(&self.stats.unreadable_gc, correlator.unreadable_events);
-        ReaderStats::set(&self.stats.stale, correlator.stale_entries);
+        SourceStats::set(&self.stats.gcs, correlator.gcs);
+        SourceStats::set(&self.stats.unreadable_gc, correlator.unreadable_events);
+        SourceStats::set(&self.stats.stale, correlator.stale_entries);
     }
 }
 
-/// The reader actor's whole job: read, decode, forward. `slot` ties the stream to its
-/// target in the router. A full mailbox blocks here — that is the backpressure (D13): the
-/// pipe fills, the runtime drops, and the parser counts the sequence gaps.
-pub fn run_reader(
+/// The session source's whole job: read, decode, forward. `slot` ties the stream to its
+/// target in the pipeline. A full channel blocks here — that is the backpressure (D13):
+/// the pipe fills, the runtime drops, and the parser counts the sequence gaps.
+pub fn run_session_source(
     slot: u32,
     mut session: EventSession,
     tx: Producer<Message>,
-    stats: Arc<ReaderStats>,
+    stats: Arc<SourceStats>,
 ) {
     let mut decoder = SessionDecoder::new(stats);
-    let mut forward = |item| tx.send((slot, Input::Session(item)));
+    let mut forward = |item| tx.send((slot, Record::Session(item)));
     let end = loop {
         match session.read_chunk(decoder.spare()) {
             Ok(0) => break SessionEnd::StreamClosed,
@@ -246,5 +174,5 @@ pub fn run_reader(
         }
     };
     decoder.finish(&mut forward);
-    tx.send((slot, Input::Session(SessionItem::Ended(end))));
+    tx.send((slot, Record::Session(SessionItem::Ended(end))));
 }

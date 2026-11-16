@@ -1,5 +1,11 @@
-//! Actor wiring and lifecycle: attach targets, spawn the reader and sampler actors, drive
-//! the router's cadence, and shut everything down gracefully (stop sessions, drain, flush).
+//! Wiring and lifecycle: place targets on shards, spawn the sources and the pipeline
+//! threads, drive the cadences no single shard owns (reports, self-telemetry), and shut
+//! everything down gracefully (stop sessions, drain, flush).
+//!
+//! Threading (`docs/architecture.md` D13/D14): one `wolf-source-<pid>` thread per target,
+//! one `wolf-process-source` thread, one `wolf-pipeline-<shard>` thread per physical
+//! shard, plus the `wolf-runtime` thread driving tokio for request/response commands.
+//! The main thread attaches targets, then only supervises.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -9,25 +15,35 @@ use std::time::{Duration, Instant};
 
 use wolf_contract::Timestamp;
 use wolf_ipc::{DiagnosticsClient, SessionId};
-use wolf_storage::{DuckDbStore, Storage};
+use wolf_storage::{ShardStore, shard_dir};
 
 use crate::attach::{Attached, attach, target_id, telemetry_session_config};
-use crate::mailbox::{Wakeup, mailbox};
-use crate::router::Router;
-use crate::sampler::{Sampler, SamplerTarget};
-use crate::session::{ReaderStats, ReaderStatsSnapshot, run_reader};
+use crate::channel::{Producer, Wakeup, channel};
+use crate::pipeline::{
+    Pipeline, PipelineConfig, PipelineHandle, PipelineStatsSnapshot, RetentionConfig,
+};
+use crate::placement::Placement;
+use crate::record::{Message, Record};
+use crate::sources::process::{ProcessSource, ProcessTarget};
+use crate::sources::session::run_session_source;
+use crate::sources::{SourceStats, SourceStatsSnapshot};
 use crate::telemetry::SelfTelemetry;
+use crate::transform::TargetFlags;
 use crate::{Error, Result};
 
-/// How long raw points stay at full resolution before the retention job downsamples them
-/// (`docs/architecture.md` §4: a few days).
+/// How long raw points stay at full resolution before retention downsamples them and
+/// drops their day segments (`docs/architecture.md` §4: a few days).
 const RAW_WINDOW: Duration = Duration::from_secs(72 * 60 * 60);
 
 #[derive(Debug, Clone)]
 pub struct HostConfig {
-    pub db_path: PathBuf,
+    /// Store directory: one `shard-NN/` subdirectory per pipeline (D14).
+    pub db_dir: PathBuf,
+    /// Physical shards = pipeline threads. Targets are placed by stable hash over 256
+    /// fixed logical buckets (`placement`), so changing this never reshuffles old files.
+    pub shards: u16,
     pub pids: Vec<u32>,
-    /// Batches land in storage this often.
+    /// Batches land in storage this often (per pipeline).
     pub flush_interval: Duration,
     /// OS memory sampling cadence.
     pub sample_interval: Duration,
@@ -35,30 +51,25 @@ pub struct HostConfig {
     pub threads_every_samples: u32,
     /// Self-telemetry report cadence.
     pub report_interval: Duration,
-    /// Ring slots per session reader. ~150 B per slot: 2048 slots ≈ 300 KiB per target.
-    pub reader_ring: usize,
-    /// Ring slots for the sampler (one message per target per tick).
+    /// Ring slots per session source. ~150 B per slot: 2048 slots ≈ 300 KiB per target.
+    pub session_ring: usize,
+    /// Ring slots of the process source's channel to each pipeline.
     pub sampler_ring: usize,
-    /// Full-resolution window and how often the retention job runs.
+    /// Full-resolution window and how often each pipeline runs retention.
     pub retention: Option<RetentionConfig>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct RetentionConfig {
-    pub window: Duration,
-    pub every: Duration,
 }
 
 impl Default for HostConfig {
     fn default() -> Self {
         Self {
-            db_path: PathBuf::from("wolf.duckdb"),
+            db_dir: PathBuf::from("wolf.db"),
+            shards: 4,
             pids: Vec::new(),
             flush_interval: Duration::from_secs(1),
             sample_interval: Duration::from_secs(1),
             threads_every_samples: 60,
             report_interval: Duration::from_secs(60),
-            reader_ring: 2048,
+            session_ring: 2048,
             sampler_ring: 64,
             retention: Some(RetentionConfig {
                 window: RAW_WINDOW,
@@ -74,32 +85,55 @@ pub struct HostReport {
     pub attached: usize,
     pub detached: usize,
     pub uptime: Duration,
-    pub router: crate::RouterStats,
-    pub readers: ReaderStatsSnapshot,
+    pub pipelines: PipelineStatsSnapshot,
+    pub sources: SourceStatsSnapshot,
     pub sample_errors: u64,
 }
 
 /// One running target: what the host needs at stop time.
 struct TargetCtx {
+    /// The physical shard (pipeline) owning this target.
+    pipeline: usize,
     slot: u32,
     pid: u32,
     client: DiagnosticsClient,
     session_id: SessionId,
-    active: Arc<AtomicBool>,
-    stats: Arc<ReaderStats>,
-    reader: JoinHandle<()>,
+    flags: TargetFlags,
+    stats: Arc<SourceStats>,
+    source: JoinHandle<()>,
 }
 
 /// Attaches, collects, and shuts down. Blocks until every target detaches or ctrl-c.
 pub fn run(config: &HostConfig) -> Result<HostReport> {
     let started = Instant::now();
-    let store = DuckDbStore::open(&config.db_path)?;
-    let wakeup = Arc::new(Wakeup::default());
-    let mut router = Router::new(store, Arc::clone(&wakeup));
+    let placement = Placement::new(config.shards);
 
-    // The host watches itself (D11).
+    // One pipeline per physical shard. Everything is registered before the threads start.
+    let pipeline_config = PipelineConfig {
+        flush_interval: config.flush_interval,
+        retention: config.retention,
+    };
+    let mut pipelines: Vec<Pipeline<ShardStore>> = Vec::new();
+    for shard in 0..placement.physical() {
+        let store = ShardStore::open(shard_dir(&config.db_dir, shard))?;
+        pipelines.push(Pipeline::new(
+            store,
+            Arc::new(Wakeup::default()),
+            pipeline_config,
+        ));
+    }
+
+    // The host watches itself (D11): registered on the shard its own target id maps to,
+    // fed over a small channel like any source.
     let self_telemetry = SelfTelemetry::new(target_id(std::process::id())?);
-    router.register_self(self_telemetry, Timestamp::now())?;
+    let self_shard = placement.shard_of(self_telemetry.target()) as usize;
+    let self_tx = {
+        let pipeline = &mut pipelines[self_shard];
+        let (tx, rx) = channel(&pipeline.handle().wakeup, 8);
+        pipeline.add_channel(rx);
+        pipeline.register_self(self_telemetry, Timestamp::now())?;
+        tx
+    };
 
     // tokio is for request/response commands only (D13); the data path stays on plain
     // threads. A driver thread keeps the runtime alive and turns ctrl-c into a flag.
@@ -116,7 +150,7 @@ pub fn run(config: &HostConfig) -> Result<HostReport> {
                 runtime.block_on(async move {
                     let _ = tokio::signal::ctrl_c().await;
                     shutdown.store(true, Ordering::SeqCst);
-                    // Park: the runtime must outlive the router loop for stop_session.
+                    // Park: the runtime must outlive the sources for stop_session.
                     std::future::pending::<()>().await
                 });
             }
@@ -125,7 +159,7 @@ pub fn run(config: &HostConfig) -> Result<HostReport> {
     // Attach every pid; failures are reported and skipped.
     let mut ctxs = Vec::new();
     for &pid in &config.pids {
-        match start_target(pid, config, &handle, &mut router, &wakeup) {
+        match start_target(pid, config, placement, &handle, &mut pipelines) {
             Ok(ctx) => ctxs.push(ctx),
             Err(error) => eprintln!("mrwolf: pid {pid}: {error}"),
         }
@@ -134,82 +168,138 @@ pub fn run(config: &HostConfig) -> Result<HostReport> {
         return Err(Error::NoTargets);
     }
 
-    // The sampler actor watches every attached target.
+    // The process source watches every attached target, one channel per pipeline.
     let sampler_stop = Arc::new(AtomicBool::new(false));
     let sample_errors = Arc::new(AtomicU64::new(0));
-    let sampler = {
-        let (tx, rx) = mailbox(&wakeup, config.sampler_ring);
-        router.add_mailbox(rx);
-        let targets = ctxs
-            .iter()
-            .map(|ctx| SamplerTarget {
+    let process_source = {
+        let mut txs: Vec<Option<Producer<Message>>> = Vec::new();
+        txs.resize_with(pipelines.len(), || None);
+        let mut targets = Vec::new();
+        for ctx in &ctxs {
+            let tx = match &txs[ctx.pipeline] {
+                Some(tx) => tx.clone(),
+                None => {
+                    let pipeline = &mut pipelines[ctx.pipeline];
+                    let (tx, rx) = channel(&pipeline.handle().wakeup, config.sampler_ring);
+                    pipeline.add_channel(rx);
+                    txs[ctx.pipeline] = Some(tx.clone());
+                    tx
+                }
+            };
+            targets.push(ProcessTarget {
                 slot: ctx.slot,
                 pid: ctx.pid,
-                active: Arc::clone(&ctx.active),
-            })
-            .collect();
-        let actor = Sampler {
+                active: Arc::clone(&ctx.flags.active),
+                tx,
+            });
+        }
+        let source = ProcessSource {
             targets: Mutex::new(targets),
-            tx,
             interval: config.sample_interval,
             threads_every: config.threads_every_samples,
             stop: Arc::clone(&sampler_stop),
             sample_errors: Arc::clone(&sample_errors),
         };
         std::thread::Builder::new()
-            .name("wolf-sampler".into())
-            .spawn(move || actor.run())?
+            .name("wolf-process-source".into())
+            .spawn(move || source.run())?
     };
 
-    let drive_result = drive(
+    // All channels are registered; start the pipelines.
+    let mut pipelines_handles = Vec::new();
+    let mut pipeline_threads = Vec::new();
+    for (shard, pipeline) in pipelines.into_iter().enumerate() {
+        pipelines_handles.push(pipeline.handle());
+        pipeline_threads.push(
+            std::thread::Builder::new()
+                .name(format!("wolf-pipeline-{shard:02}"))
+                .spawn(move || pipeline.run())?,
+        );
+    }
+
+    supervise(
         config,
-        &mut router,
-        &mut ctxs,
+        &pipelines_handles,
+        &pipeline_threads,
+        &ctxs,
         &handle,
         &shutdown,
         &sampler_stop,
+        &self_tx,
     );
 
-    // Cleanup: stop sampling, stop sessions (if not already), drain readers dry, flush.
-    sampler_stop.store(true, Ordering::SeqCst);
-    stop_sessions(&mut router, &ctxs, &handle);
-    while !ctxs.iter().all(|ctx| ctx.reader.is_finished()) {
-        router.drain();
-        router.wait(Duration::from_millis(50));
+    // Sources are done (supervise waits for them). A last report so short runs still
+    // record self-telemetry, then stop the pipelines: they drain what is left, flush,
+    // and exit.
+    let totals = SourceStatsSnapshot::total(ctxs.iter().map(|ctx| ctx.stats.snapshot()));
+    let rss = wolf_process::sample(std::process::id())
+        .map(|sample| sample.rss)
+        .unwrap_or(0);
+    self_tx.send((
+        0,
+        Record::SelfReport {
+            ts: Timestamp::now(),
+            totals,
+            rss,
+        },
+    ));
+    for handle in &pipelines_handles {
+        handle.stop.store(true, Ordering::SeqCst);
+        handle.wakeup.notify();
     }
-    // A last report so short runs still record self-telemetry.
-    let totals = ReaderStatsSnapshot::total(ctxs.iter().map(|ctx| ctx.stats.snapshot()));
-    router.self_report(Timestamp::now(), &totals);
-    if let Err(error) = router.flush() {
-        eprintln!("mrwolf: final flush failed: {error}");
-    }
-    drive_result?;
-    let report = HostReport {
-        attached: ctxs.len(),
-        detached: router.detached_count(),
-        uptime: started.elapsed(),
-        router: *router.stats(),
-        readers: ReaderStatsSnapshot::total(ctxs.iter().map(|ctx| ctx.stats.snapshot())),
-        sample_errors: sample_errors.load(Ordering::Relaxed),
-    };
-    for ctx in ctxs {
-        if ctx.reader.join().is_err() {
-            eprintln!("mrwolf: pid {}: reader thread panicked", ctx.pid);
+
+    let mut first_error = None;
+    for (shard, thread) in pipeline_threads.into_iter().enumerate() {
+        match thread.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                eprintln!("mrwolf: pipeline {shard:02} failed: {error}");
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+            Err(_) => eprintln!("mrwolf: pipeline {shard:02} thread panicked"),
         }
     }
-    if sampler.join().is_err() {
-        eprintln!("mrwolf: sampler thread panicked");
+    let attached = ctxs.len();
+    let detached = ctxs
+        .iter()
+        .filter(|ctx| ctx.flags.detached.load(Ordering::Relaxed))
+        .count();
+    for ctx in ctxs {
+        if ctx.source.join().is_err() {
+            eprintln!("mrwolf: pid {}: session source thread panicked", ctx.pid);
+        }
     }
-    Ok(report)
+    if process_source.join().is_err() {
+        eprintln!("mrwolf: process source thread panicked");
+    }
+    let report = HostReport {
+        attached,
+        detached,
+        uptime: started.elapsed(),
+        pipelines: PipelineStatsSnapshot::total(
+            pipelines_handles
+                .iter()
+                .map(|handle| handle.stats.snapshot()),
+        ),
+        sources: totals,
+        sample_errors: sample_errors.load(Ordering::Relaxed),
+    };
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(report),
+    }
 }
 
-/// Attaches one pid: registers it, opens the telemetry session, spawns its reader actor.
+/// Attaches one pid: registers it on its shard, opens the telemetry session, spawns its
+/// session source.
 fn start_target(
     pid: u32,
     config: &HostConfig,
+    placement: Placement,
     handle: &tokio::runtime::Handle,
-    router: &mut Router<DuckDbStore>,
-    wakeup: &Arc<Wakeup>,
+    pipelines: &mut [Pipeline<ShardStore>],
 ) -> Result<TargetCtx> {
     let Attached {
         client,
@@ -219,125 +309,123 @@ fn start_target(
         ec,
         process,
     } = attach(pid, handle)?;
-    let slot = router.add_target(id.clone(), Timestamp::now(), gc, ec, process)?;
-    router.target_attached(slot, &info);
+    let shard = placement.shard_of(&id) as usize;
+    let pipeline = &mut pipelines[shard];
+    let (slot, flags) = pipeline.attach(id.clone(), Timestamp::now(), gc, ec, process)?;
+    pipeline.target_attached(slot, &info);
     let session = match client.start_session(&telemetry_session_config()) {
         Ok(session) => session,
         Err(error) => {
             let reason = format!("session failed to start: {error}");
-            router.detach_with_error(slot, &reason);
+            pipeline.detach_with_error(slot, &reason);
             return Err(Error::Ipc(error));
         }
     };
-    router.session_started(slot, session.id());
+    pipeline.session_started(slot, session.id());
     let session_id = session.id();
-    let (tx, rx) = mailbox(wakeup, config.reader_ring);
-    router.add_mailbox(rx);
-    let stats = Arc::new(ReaderStats::default());
-    let reader = std::thread::Builder::new()
-        .name(format!("wolf-reader-{pid}"))
+    let (tx, rx) = channel(&pipeline.handle().wakeup, config.session_ring);
+    pipeline.add_channel(rx);
+    let stats = Arc::new(SourceStats::default());
+    let source = std::thread::Builder::new()
+        .name(format!("wolf-source-{pid}"))
         .spawn({
             let stats = Arc::clone(&stats);
-            move || run_reader(slot, session, tx, stats)
+            move || run_session_source(slot, session, tx, stats)
         })?;
     Ok(TargetCtx {
+        pipeline: shard,
         slot,
         pid,
         client,
         session_id,
-        active: router.active_flag(slot),
+        flags,
         stats,
-        reader,
+        source,
     })
 }
 
-/// The router loop: drain mailboxes, run the cadence, stop when all targets are gone or
-/// ctrl-c arrives. Returns early only on a storage failure (the host's purpose is gone).
-fn drive(
+/// The supervision loop: report on cadence, and start shutdown when ctrl-c arrives, when
+/// every target has detached, or when a pipeline died (its error surfaces at join).
+/// Shutdown order matters: sources must be finished before the pipelines' stop flags go
+/// up, so no record is ever left undrained.
+#[allow(clippy::too_many_arguments)]
+fn supervise(
     config: &HostConfig,
-    router: &mut Router<DuckDbStore>,
-    ctxs: &mut [TargetCtx],
+    pipelines: &[PipelineHandle],
+    pipeline_threads: &[JoinHandle<Result<()>>],
+    ctxs: &[TargetCtx],
     handle: &tokio::runtime::Handle,
     shutdown: &Arc<AtomicBool>,
     sampler_stop: &Arc<AtomicBool>,
-) -> Result<()> {
-    let mut next_flush = Instant::now() + config.flush_interval;
+    self_tx: &Producer<Message>,
+) {
     let mut next_report = Instant::now() + config.report_interval;
-    let mut next_retain = config.retention.as_ref().map(|r| Instant::now() + r.every);
     let mut stopping = false;
-    let mut first_error = None;
     loop {
-        router.drain();
         let now = Instant::now();
-        if now >= next_flush {
-            if let Err(error) = router.flush() {
-                first_error = Some(error);
-                break;
-            }
-            next_flush = now + config.flush_interval;
-        }
         if now >= next_report {
-            let totals = ReaderStatsSnapshot::total(ctxs.iter().map(|ctx| ctx.stats.snapshot()));
-            router.self_report(Timestamp::now(), &totals);
-            println!(
-                "mrwolf: targets={} events={} dropped={} bytes={} written={}p/{}e skipped={}",
-                ctxs.iter()
-                    .filter(|ctx| !router.is_detached(ctx.slot))
-                    .count(),
-                totals.events,
-                totals.dropped,
-                totals.bytes,
-                router.stats().points_written,
-                router.stats().events_written,
-                router.stats().counters_skipped,
-            );
+            report(ctxs, pipelines, self_tx);
             next_report = now + config.report_interval;
         }
-        if let Some(retention) = &config.retention
-            && next_retain.is_some_and(|next| now >= next)
+        let pipeline_died = pipeline_threads.iter().any(JoinHandle::is_finished);
+        if !stopping
+            && (shutdown.load(Ordering::Relaxed)
+                || pipeline_died
+                || ctxs
+                    .iter()
+                    .all(|ctx| ctx.flags.detached.load(Ordering::Relaxed)))
         {
-            let cutoff = Timestamp::from_nanos(
-                Timestamp::now().as_nanos()
-                    - i64::try_from(retention.window.as_nanos()).unwrap_or(i64::MAX),
-            );
-            match router.store_mut().retain(cutoff) {
-                Ok(done) => println!(
-                    "mrwolf: retention: {} minutes downsampled, {} raw points deleted",
-                    done.minutes_downsampled, done.points_deleted,
-                ),
-                Err(error) => eprintln!("mrwolf: retention failed: {error}"),
-            }
-            next_retain = Some(now + retention.every);
-        }
-        if shutdown.load(Ordering::Relaxed) && !stopping {
             stopping = true;
             sampler_stop.store(true, Ordering::SeqCst);
             println!("mrwolf: stopping sessions...");
-            stop_sessions(router, ctxs, handle);
+            stop_sessions(ctxs, handle);
         }
-        if ctxs.iter().all(|ctx| router.is_detached(ctx.slot)) {
+        if stopping && ctxs.iter().all(|ctx| ctx.source.is_finished()) {
             break;
         }
-        router.wait(Duration::from_millis(100));
-    }
-    match first_error {
-        Some(error) => Err(error),
-        None => Ok(()),
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
-/// Stops every live session; the runtime flushes and closes the stream, so the reader
-/// actor sees end of stream and finishes what it has (graceful detach, P1-8).
-fn stop_sessions(
-    router: &mut Router<DuckDbStore>,
-    ctxs: &[TargetCtx],
-    handle: &tokio::runtime::Handle,
-) {
+/// One report tick: self-telemetry into its pipeline, then the console line.
+fn report(ctxs: &[TargetCtx], pipelines: &[PipelineHandle], self_tx: &Producer<Message>) {
+    let totals = SourceStatsSnapshot::total(ctxs.iter().map(|ctx| ctx.stats.snapshot()));
+    let rss = wolf_process::sample(std::process::id())
+        .map(|sample| sample.rss)
+        .unwrap_or(0);
+    self_tx.send((
+        0,
+        Record::SelfReport {
+            ts: Timestamp::now(),
+            totals,
+            rss,
+        },
+    ));
+    let written =
+        PipelineStatsSnapshot::total(pipelines.iter().map(|handle| handle.stats.snapshot()));
+    println!(
+        "mrwolf: targets={} events={} dropped={} bytes={} written={}p/{}e skipped={}",
+        ctxs.iter()
+            .filter(|ctx| !ctx.flags.detached.load(Ordering::Relaxed))
+            .count(),
+        totals.events,
+        totals.dropped,
+        totals.bytes,
+        written.points_written,
+        written.events_written,
+        written.counters_skipped,
+    );
+}
+
+/// Stops every live session; the runtime flushes and closes the stream, so the session
+/// source sees end of stream and finishes what it has (graceful detach, P1-8).
+fn stop_sessions(ctxs: &[TargetCtx], handle: &tokio::runtime::Handle) {
     for ctx in ctxs {
-        if router.is_detached(ctx.slot) {
+        // Mark first: the clean end that follows reports "stopped", not "exited".
+        ctx.flags.detaching.store(true, Ordering::Relaxed);
+        if ctx.flags.detached.load(Ordering::Relaxed) {
             continue;
         }
-        router.begin_detach(ctx.slot);
         if let Err(error) = handle.block_on(ctx.client.stop_session(ctx.session_id)) {
             eprintln!("mrwolf: pid {}: stop_session failed: {error}", ctx.pid);
         }

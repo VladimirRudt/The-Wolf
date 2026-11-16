@@ -1,9 +1,9 @@
-//! Mailboxes between actors: preallocated bounded **circular buffers** (crossbeam
-//! `ArrayQueue`) — fixed memory per actor link, no allocation per message. Each producer
-//! has its own mailbox; the router polls them round-robin.
+//! Channels between pipeline stages: preallocated bounded **circular buffers** (crossbeam
+//! `ArrayQueue`) — fixed memory per link, no allocation per message. Each producer has
+//! its own channel; the pipeline drains them round-robin.
 //!
 //! Backpressure is explicit (D13): a producer whose ring is full blocks in [`Producer::send`]
-//! — for a session reader that means the pipe fills, the runtime's circular buffer fills,
+//! — for a session source that means the pipe fills, the runtime's circular buffer fills,
 //! and the runtime drops events, which the parser counts as sequence gaps. Nothing grows
 //! unboundedly anywhere in the chain.
 //!
@@ -23,8 +23,8 @@ fn lock<'a, T>(mutex: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// The router's alarm clock: producers ring it when a mailbox goes from empty to
-/// non-empty. One for the whole router.
+/// The pipeline's alarm clock: producers ring it when a channel goes from empty to
+/// non-empty. One per pipeline.
 #[derive(Debug, Default)]
 pub struct Wakeup {
     lock: Mutex<()>,
@@ -32,9 +32,9 @@ pub struct Wakeup {
 }
 
 impl Wakeup {
-    fn notify(&self) {
+    pub(crate) fn notify(&self) {
         // Holding the lock while notifying pairs with `wait_if`'s check-then-wait: either
-        // the router sees the item in its check, or it is already waiting and wakes.
+        // the pipeline sees the item in its check, or it is already waiting and wakes.
         let _guard = lock(&self.lock);
         self.cond.notify_one();
     }
@@ -49,7 +49,8 @@ impl Wakeup {
     }
 }
 
-/// The producing end of one mailbox. `Send + Sync`; one per actor.
+/// The producing end of one channel. `Send + Sync`; one per source, cheap to clone (the
+/// process source shares one channel per pipeline across its targets).
 #[derive(Debug)]
 pub struct Producer<T> {
     ring: Arc<ArrayQueue<T>>,
@@ -57,15 +58,29 @@ pub struct Producer<T> {
     space: Arc<(Mutex<()>, Condvar)>,
 }
 
+// Manual: the shared state is all `Arc`s, so cloning a producer must not require
+// `T: Clone`.
+impl<T> Clone for Producer<T> {
+    fn clone(&self) -> Self {
+        Self {
+            ring: Arc::clone(&self.ring),
+            wakeup: Arc::clone(&self.wakeup),
+            space: Arc::clone(&self.space),
+        }
+    }
+}
+
 impl<T> Producer<T> {
     /// Appends one message, blocking while the ring is full (the backpressure point).
-    /// Never allocates: the ring's slots exist since [`mailbox`].
+    /// Never allocates: the ring's slots exist since [`channel`].
     pub fn send(&self, mut item: T) {
         loop {
             match self.ring.push(item) {
                 Ok(()) => {
-                    // The router drains fully before sleeping, so "was empty" is the only
-                    // transition it can miss. Single producer per ring: len is exact here.
+                    // The pipeline drains fully before sleeping, so "was empty" is the only
+                    // transition it can miss. With one producer per channel, len is exact
+                    // here; with several (the process source shares a channel) a missed
+                    // wakeup costs one wait timeout.
                     if self.ring.len() == 1 {
                         self.wakeup.notify();
                     }
@@ -81,7 +96,7 @@ impl<T> Producer<T> {
     }
 }
 
-/// The consuming end of one mailbox; the router owns one per producer.
+/// The consuming end of one channel; the pipeline owns one per producer.
 #[derive(Debug)]
 pub struct Consumer<T> {
     ring: Arc<ArrayQueue<T>>,
@@ -110,7 +125,7 @@ impl<T> Consumer<T> {
 }
 
 /// One bounded ring: `capacity` slots, preallocated.
-pub fn mailbox<T>(wakeup: &Arc<Wakeup>, capacity: usize) -> (Producer<T>, Consumer<T>) {
+pub fn channel<T>(wakeup: &Arc<Wakeup>, capacity: usize) -> (Producer<T>, Consumer<T>) {
     let ring = Arc::new(ArrayQueue::new(capacity));
     let space = Arc::new((Mutex::new(()), Condvar::new()));
     (
@@ -132,7 +147,7 @@ mod tests {
     #[test]
     fn messages_arrive_in_order_without_allocation() {
         let wakeup = Arc::new(Wakeup::default());
-        let (producer, mut consumer) = mailbox(&wakeup, 4);
+        let (producer, mut consumer) = channel(&wakeup, 4);
         for i in 0..3 {
             producer.send(i);
         }
@@ -145,7 +160,7 @@ mod tests {
     #[test]
     fn a_full_ring_blocks_the_producer_until_drained() {
         let wakeup = Arc::new(Wakeup::default());
-        let (producer, mut consumer) = mailbox(&wakeup, 2);
+        let (producer, mut consumer) = channel(&wakeup, 2);
         producer.send(1);
         producer.send(2);
 
@@ -170,7 +185,7 @@ mod tests {
     #[test]
     fn the_router_wakes_for_a_fresh_item_and_times_out_otherwise() {
         let wakeup = Arc::new(Wakeup::default());
-        let (producer, mut consumer) = mailbox(&wakeup, 4);
+        let (producer, mut consumer) = channel(&wakeup, 4);
 
         let started = Instant::now();
         wakeup.wait_if(Duration::from_millis(50), || consumer.is_empty());

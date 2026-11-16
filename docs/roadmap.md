@@ -82,6 +82,7 @@ Phased plan. Each task is sized to be implemented in one focused session (human 
 
 ## Phase 5 — Later
 
+- **Durable spool** (WAL) between sources and pipelines: per-shard segment files with acknowledgement after the sink flushes, so a stalled or crashed writer never drops telemetry; tiered load shedding under a full spool (drop gen0 summaries and counters first, lifecycle events last).
 - **Vincent** deep mode (Rust cdylib, Profiling API): exact allocations, object lifetimes (MovedReferences2/SurvivingReferences2), GC handles, ms-level `GetGenerationBounds` polling.
 - Reverse diagnostic ports for containers/Kubernetes.
 - Postgres collector (same contract; memory via OS collector + Postgres views).

@@ -8,6 +8,9 @@ pub enum Error {
     /// The embedded database reported a failure.
     #[error("duckdb: {0}")]
     DuckDb(#[from] duckdb::Error),
+    /// Segment files: creating directories, removing retired segments, listing shards.
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
     /// Data read back violates the contract (e.g. a stored target id does not parse).
     /// Only reachable with a corrupted database; callers treat it as fatal for the query.
     #[error("stored data violates the contract: {0}")]

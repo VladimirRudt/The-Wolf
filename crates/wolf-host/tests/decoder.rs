@@ -1,4 +1,4 @@
-//! Drives the reader actor's decode path (`SessionDecoder`) with the recorded nettrace
+//! Drives the session source's decode path (`SessionDecoder`) with the recorded nettrace
 //! streams, like the golden tests in `wolf-dotnet`, and checks the plumbing end to end:
 //! GC telemetry, counters, gen0 summaries, clean stats.
 
@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use wolf_dotnet::DotnetTelemetry;
-use wolf_host::{ReaderStats, SessionDecoder, SessionItem};
+use wolf_host::{SessionDecoder, SessionItem, SourceStats};
 
 fn recordings() -> Vec<PathBuf> {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/nettrace");
@@ -20,9 +20,9 @@ fn recordings() -> Vec<PathBuf> {
     paths
 }
 
-/// Feeds a recording through the decoder in small chunks, as the reader thread would.
-fn decode_all(stream: &[u8]) -> (Vec<SessionItem>, wolf_host::ReaderStatsSnapshot) {
-    let stats = Arc::new(ReaderStats::default());
+/// Feeds a recording through the decoder in small chunks, as the source thread would.
+fn decode_all(stream: &[u8]) -> (Vec<SessionItem>, wolf_host::SourceStatsSnapshot) {
+    let stats = Arc::new(SourceStats::default());
     let mut decoder = SessionDecoder::new(Arc::clone(&stats));
     let mut items = Vec::new();
     let mut rest = stream;

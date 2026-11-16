@@ -1,6 +1,6 @@
 //! .NET collector: discovery, EventPipe sessions, GC telemetry, heap snapshot capture.
 //!
-//! GC telemetry (`docs/collector-dotnet.md` §3.2), on the session's reader thread:
+//! GC telemetry (`docs/collector-dotnet.md` §3.2), on the session source's thread:
 //!
 //! ```text
 //! wolf_nettrace::Event → GcTracker → DotnetTelemetry → (session channel) → to_contract → storage
