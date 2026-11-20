@@ -1,19 +1,18 @@
-//! Sources: the ingress stage of every pipeline (Vector-style naming). A source owns no
-//! contract or storage knowledge — it produces [`crate::Record`]s into a bounded channel
-//! and the pipeline's transform maps them.
+//! Producers: the plain threads that feed the graph (D13/D15). A producer owns no
+//! contract or storage knowledge — it posts messages into a block's bounded input
+//! buffer and the block maps them. Only the .NET session needs a producer (blocking
+//! reads on the EventPipe stream); the process block samples on its own tick.
 //!
 //! - [`session`]: one blocking thread per attached target, reading its EventPipe stream.
-//! - [`process`]: one thread sampling OS memory of every live target on a fixed cadence.
 
-pub mod process;
 pub mod session;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Cumulative source-side counters, shared with the pipeline (self-telemetry, D11).
-/// Written by the session source thread only; read once a minute.
+/// Cumulative producer-side counters of one session, shared with the host (self-telemetry, D11).
+/// Written by the session producer thread only; read once a minute.
 #[derive(Debug, Default)]
-pub struct SourceStats {
+pub struct SessionStats {
     pub bytes: AtomicU64,
     /// Parser counters (`wolf_nettrace::Stats`), copied after every commit.
     pub events: AtomicU64,
@@ -29,15 +28,15 @@ pub struct SourceStats {
     pub unreadable_counters: AtomicU64,
 }
 
-impl SourceStats {
+impl SessionStats {
     pub(crate) fn set(slot: &AtomicU64, value: u64) {
         slot.store(value, Ordering::Relaxed);
     }
 
-    /// A consistent-enough copy for reporting (Relaxed; the source updates in bursts).
-    pub fn snapshot(&self) -> SourceStatsSnapshot {
+    /// A consistent-enough copy for reporting (Relaxed; the producer updates in bursts).
+    pub fn snapshot(&self) -> SessionStatsSnapshot {
         let get = |slot: &AtomicU64| slot.load(Ordering::Relaxed);
-        SourceStatsSnapshot {
+        SessionStatsSnapshot {
             bytes: get(&self.bytes),
             events: get(&self.events),
             dropped: get(&self.dropped),
@@ -51,9 +50,9 @@ impl SourceStats {
     }
 }
 
-/// Plain copy of [`SourceStats`].
+/// Plain copy of [`SessionStats`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct SourceStatsSnapshot {
+pub struct SessionStatsSnapshot {
     pub bytes: u64,
     pub events: u64,
     pub dropped: u64,
@@ -65,7 +64,7 @@ pub struct SourceStatsSnapshot {
     pub unreadable_counters: u64,
 }
 
-impl SourceStatsSnapshot {
+impl SessionStatsSnapshot {
     /// Field-by-field sum over any number of sources.
     pub fn total(snapshots: impl Iterator<Item = Self>) -> Self {
         let mut total = Self::default();

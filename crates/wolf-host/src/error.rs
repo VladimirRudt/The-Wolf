@@ -16,6 +16,9 @@ pub enum Error {
     Parse(#[from] wolf_nettrace::ParseError),
     #[error("target id: {0}")]
     Contract(#[from] ParseTargetIdError),
+    /// A dataflow block is gone when the host tried to use it (fatal faults surface here).
+    #[error("dataflow: {0}")]
+    Graph(String),
     /// No diagnostic endpoint for this pid: not a .NET process, another user's process, or
     /// an endpoint directory we don't scan (`docs/collector-dotnet.md` §2).
     #[error("no diagnostic endpoint found for pid {0}")]

@@ -22,19 +22,68 @@
 //! reads for its own shard only.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::str;
 
 use duckdb::{Connection, params, params_from_iter};
-use wolf_contract::{Event, Point, SeriesDescriptor, SeriesId, TargetId, Timestamp};
+use wolf_contract::{Event, Point, SeriesDescriptor, SeriesId, TargetId, Timestamp, Unit};
 
 use crate::date::Date;
-use crate::duckdb::{Scratch, unit_text};
 use crate::store::parse_target;
 use crate::{Error, Result, Retention, Storage, TargetInfo};
 
+/// Scratch capacity beyond this is handed back to the allocator after a batch: one rogue
+/// payload (a huge `data` document) must not pin its allocation for the life of the store.
+const MAX_SCRATCH_BYTES: usize = 1 << 20;
+
+/// Serialized forms for the insert path: target id text and JSON payload bytes. Owned by
+/// the store, cleared per row, reused across every batch — after the first batches these
+/// hold steady-state capacity and inserts allocate nothing.
+#[derive(Debug, Default)]
+struct Scratch {
+    target: String,
+    json: Vec<u8>,
+}
+
+impl Scratch {
+    /// Re-serialize `target` and `payload`, then hand out the borrowed pair for one
+    /// appender row. The borrows end with the row; the capacity stays.
+    fn row<'a>(
+        &'a mut self,
+        target: &TargetId,
+        payload: &impl serde::Serialize,
+    ) -> Result<(&'a str, &'a str)> {
+        self.target.clear();
+        write!(self.target, "{target}").expect("writing to a String is infallible");
+        self.json.clear();
+        serde_json::to_writer(&mut self.json, payload)?;
+        Ok((
+            self.target.as_str(),
+            str::from_utf8(&self.json).expect("serde_json emits UTF-8"),
+        ))
+    }
+
+    /// Drop excess capacity after a batch (see [`MAX_SCRATCH_BYTES`]).
+    fn release_burst(&mut self) {
+        if self.json.capacity() > MAX_SCRATCH_BYTES {
+            self.json = Vec::new();
+        }
+    }
+}
+
+/// Serializes a unit to its catalogue string (`"bytes"`, `"count"`, …; unknown units as
+/// their raw text). Reuses the contract's serde rules so storage and wire agree.
+fn unit_text(unit: &Unit) -> Result<String> {
+    let value = serde_json::to_value(unit)?;
+    value
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| Error::Contract(format!("unit does not serialize to a string: {value}")))
+}
+
 /// Version of the sharded on-disk layout, recorded in `wolf_meta` of each `meta.duckdb`.
-/// Independent of the single-file [`crate::DuckDbStore`] schema version.
 const SHARD_SCHEMA_VERSION: u32 = 1;
 
 /// Segment file naming: `seg-YYYY-MM-DD.duckdb`.
@@ -82,7 +131,7 @@ pub fn shard_dir(root: &Path, shard: u16) -> PathBuf {
 /// one attached catalog per day-segment of raw points, one for downsampled history.
 ///
 /// Resource budget: shards multiply DuckDB connections, so the default [`Config`] here is
-/// smaller than the single-file store's — one engine thread per shard.
+/// deliberately small — one engine thread per shard.
 #[derive(Debug)]
 pub struct ShardStore {
     conn: Connection,
@@ -136,7 +185,7 @@ impl ShardStore {
             config.threads, config.memory_limit_mib
         ))?;
         // The primary catalog is the meta database, so metadata DDL and inserts are
-        // unqualified — same names as the single-file layout.
+        // unqualified — metadata shares one catalog.
         conn.execute_batch(META_DDL)?;
         check_schema_version(&conn)?;
         let store = Self {
@@ -260,7 +309,7 @@ impl Storage for ShardStore {
         }
         let mut by_day: BTreeMap<Date, Vec<&Point>> = BTreeMap::new();
         for point in points {
-            // Same NaN/inf rule as the single-file store: never poison an aggregate.
+            // NaN/inf would poison the retention aggregates of a whole minute bucket: skip.
             if point.value.is_finite() {
                 by_day
                     .entry(Date::from_nanos(point.ts.as_nanos()))
@@ -379,8 +428,7 @@ impl Storage for ShardStore {
     /// Retires every segment whose whole day is older than `before`: downsamples it into
     /// `longterm.points_1m` (idempotently — re-running skips buckets already present) and
     /// removes the file. No `DELETE` ever runs against the raw table. The day containing
-    /// `before` stays raw, so the effective granularity is one UTC day, not one minute
-    /// like the single-file store.
+    /// `before` stays raw, so the effective granularity is one UTC day.
     fn retain(&mut self, before: Timestamp) -> Result<Retention> {
         let cutoff_day = Date::from_nanos(before.as_nanos());
         let retiring: Vec<(Date, String)> = self

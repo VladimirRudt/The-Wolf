@@ -53,6 +53,22 @@ impl ProcessInfoVersion {
 }
 
 impl ProcessInfo {
+    /// A minimal fixture for tests in downstream crates (the struct is `non_exhaustive`,
+    /// so they cannot build one literally).
+    #[doc(hidden)]
+    pub fn for_test(pid: u32, command_line: &str) -> Self {
+        Self {
+            process_id: u64::from(pid),
+            runtime_cookie: RuntimeCookie([0; 16]),
+            command_line: command_line.to_owned(),
+            os: "test-os".to_owned(),
+            arch: "x64".to_owned(),
+            entrypoint_assembly: Some(command_line.to_owned()),
+            clr_product_version: Some("10.0.0".to_owned()),
+            runtime_identifier: None,
+        }
+    }
+
     pub(crate) fn parse(version: ProcessInfoVersion, payload: &[u8]) -> Result<Self, IpcError> {
         let mut reader = PayloadReader::new(payload);
         let payload_version = match version {

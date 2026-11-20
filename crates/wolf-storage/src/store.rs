@@ -18,17 +18,39 @@ pub struct TargetInfo {
 /// What one [`Storage::retain`] run did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Retention {
-    /// Raw points deleted.
+    /// Raw points dropped with their retired segments.
     pub points_deleted: usize,
     /// Minute buckets written to the downsampled table (skipped buckets already present
     /// from an earlier run are not counted).
     pub minutes_downsampled: usize,
-    /// The minute-aligned cutoff actually used: raw points at or after it were kept.
+    /// The day-aligned cutoff actually used: raw points at or after it were kept.
     pub cutoff: Timestamp,
 }
 
+/// How much of the host machine the embedded engine may use. DuckDB's own defaults are
+/// one thread per core and ~80% of RAM — right for an analytics workstation, wrong for a
+/// collector that must not disturb the processes it watches. The defaults are small on
+/// purpose; raise them only on a dedicated box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Config {
+    /// DuckDB worker threads.
+    pub threads: u32,
+    /// Engine memory limit, in MiB. Insert buffering, checkpoints and retention scans
+    /// share it; exceeding it spills to disk, it does not fail.
+    pub memory_limit_mib: u32,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            threads: 2,
+            memory_limit_mib: 512,
+        }
+    }
+}
+
 /// Durable store for points, events and target metadata. All methods are synchronous
-/// (D13); the host serializes access as the single writer.
+/// (D13); one shard's block is the single writer of its store (D14).
 pub trait Storage: Send {
     /// Registers a target, ignoring re-registration (first seen wins).
     fn register_target(&mut self, target: TargetId, first_seen: Timestamp) -> Result<()>;
@@ -56,13 +78,12 @@ pub trait Storage: Send {
     /// Events of one target with `range.start <= ts < range.end`, time-ordered.
     fn events(&self, target: &TargetId, range: Range<Timestamp>) -> Result<Vec<Event>>;
 
-    /// Downsamples raw points older than `before` into `points_1m` and deletes them, in
-    /// one transaction (`docs/architecture.md` §4.1). The cutoff is floored to the minute:
-    /// the partially covered trailing minute stays at full resolution. `min` keeps
-    /// sawtooth bottoms, `max` keeps spikes, `last` suits step series. Re-running over an
-    /// already-covered bucket neither duplicates nor rewrites it, so the job is safe to
-    /// repeat with any cutoff (late out-of-order points land in raw points and are picked
-    /// up by the next run only if their bucket is not already downsampled).
+    /// Retires raw points older than `before`: downsamples them into `points_1m`
+    /// (`min` keeps sawtooth bottoms, `max` keeps spikes, `last` suits step series,
+    /// §4.1) and drops their storage. Re-running is safe: buckets already downsampled
+    /// are neither duplicated nor rewritten. The granularity is the backend's choice —
+    /// the sharded layout retires whole day segments, so the partially covered current
+    /// day stays raw.
     fn retain(&mut self, before: Timestamp) -> Result<Retention>;
 }
 

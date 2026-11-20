@@ -5,7 +5,7 @@
 use wolf_contract::TargetId;
 use wolf_dotnet::{EcSeries, GcSeries};
 use wolf_ipc::{DiagnosticsClient, EventLevel, ProcessInfo, Provider, SessionConfig, discover};
-use wolf_process::{ProcessSeries, process_start_time};
+use wolf_process::process_start_time;
 
 use crate::{Error, Result};
 
@@ -24,7 +24,7 @@ pub fn telemetry_session_config() -> SessionConfig {
     ])
 }
 
-/// One attached target, before its session starts: everything the pipeline and the host
+/// One attached target, before its session starts: everything the blocks and the host
 /// need later.
 #[derive(Debug)]
 pub struct Attached {
@@ -33,7 +33,6 @@ pub struct Attached {
     pub id: TargetId,
     pub gc: GcSeries,
     pub ec: EcSeries,
-    pub process: ProcessSeries,
 }
 
 /// Finds pid's endpoint and learns the process. `handle` drives the request/response part
@@ -51,7 +50,6 @@ pub fn attach(pid: u32, handle: &tokio::runtime::Handle) -> Result<Attached> {
         info,
         gc: GcSeries::new(id.clone()),
         ec: EcSeries::new(id.clone()),
-        process: ProcessSeries::new(id.clone()),
         id,
     })
 }

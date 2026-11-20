@@ -10,14 +10,14 @@ use wolf_contract::{Fnv1a, TargetId};
 /// first target that lands in them).
 pub const LOGICAL_SHARDS: u16 = 256;
 
-/// Maps targets to this host's physical shards (pipelines).
+/// Maps targets to this host's physical shards.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Placement {
     physical: u16,
 }
 
 impl Placement {
-    /// `physical == 0` is clamped to 1: every host runs at least one pipeline.
+    /// `physical == 0` is clamped to 1: every host runs at least one shard.
     pub fn new(physical: u16) -> Self {
         Self {
             physical: physical.max(1),

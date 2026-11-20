@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use wolf_contract::{Point, SeriesDescriptor, SeriesId, TargetId, Timestamp, Unit};
 
-use crate::sources::SourceStatsSnapshot;
+use crate::producers::SessionStatsSnapshot;
 
 const EVENTS_RECEIVED: &str = "wolf.collector.events_received";
 const EVENTS_DROPPED: &str = "wolf.collector.events_dropped";
@@ -60,7 +60,7 @@ impl SelfTelemetry {
     pub fn points(
         &self,
         ts: Timestamp,
-        totals: &SourceStatsSnapshot,
+        totals: &SessionStatsSnapshot,
         memory_rss: u64,
     ) -> [Point; 4] {
         let point = |series, value| Point {

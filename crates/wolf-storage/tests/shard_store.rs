@@ -271,3 +271,57 @@ fn query_store_unions_all_shards_read_only() {
             .is_empty()
     );
 }
+
+/// The P1-7 write-path budget, on the sharded layout: 1M points in a few seconds.
+/// All points land in one day segment, so this also exercises the per-day appender path
+/// at full batch size.
+#[test]
+fn inserts_one_million_points_in_a_few_seconds() {
+    let mut store = ShardStore::open_in_memory().expect("open");
+    let target = target(0);
+    let descriptors: Vec<_> = (0..10)
+        .map(|n| {
+            let mut labels = BTreeMap::new();
+            labels.insert("generation".to_owned(), format!("gen{n}"));
+            SeriesDescriptor::new(target.clone(), "dotnet.gc.heap.size", labels, Unit::Bytes)
+        })
+        .collect();
+    store
+        .register_target(target.clone(), ts(day_ns(0)))
+        .expect("target");
+    store.register_series(&descriptors).expect("series");
+
+    let batches = 20;
+    let batch_size = 50_000; // 1M points total
+    let mut points = Vec::with_capacity(batch_size);
+    let started = std::time::Instant::now();
+    for batch in 0..batches {
+        points.clear();
+        for i in 0..batch_size {
+            let n = (batch * batch_size + i) as i64;
+            points.push(point(
+                descriptors[n as usize % descriptors.len()].id(),
+                day_ns(0) + n * 1_000_000, // 1 ms steps
+                n as f64,
+            ));
+        }
+        store.insert_points(&points).expect("batch insert");
+    }
+    let elapsed = started.elapsed();
+    println!("1M points inserted in {elapsed:.2?}");
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "1M points took {elapsed:.2?}; the few-seconds budget is blown"
+    );
+
+    // The data actually landed, in order.
+    let first = descriptors[0].id();
+    let read = store
+        .points(first, ts(0)..ts(i64::MAX))
+        .expect("range query");
+    assert_eq!(read.len(), batches * batch_size / descriptors.len());
+    assert!(
+        read.windows(2).all(|pair| pair[0].ts < pair[1].ts),
+        "time-ordered"
+    );
+}

@@ -2,55 +2,58 @@
 //! and routes points and events to storage (`docs/collector-dotnet.md` §2,
 //! `docs/architecture.md` §4).
 //!
-//! Streaming pipeline — framework-free per D13 (hand-written, plain threads, blocking
-//! std I/O in the data path; tokio only for request/response commands). Vector-style
-//! stage names: **sources** produce records, bounded **channels** carry them, and one
-//! **pipeline** per shard runs drain → **transform** → **sink**:
+//! The workflow is a dataflow graph (D15), TPL-Dataflow style: blocks with bounded input
+//! buffers, wired with `link_to`, completed by dropping their producers. There is no
+//! actor framework — blocks are built from `dataflow.rs`, one block per subsystem
+//! (`blocks/`), and the wiring in `host.rs` is the only place that knows the graph's
+//! shape:
 //!
 //! ```text
-//! per target: session source (EventSession → SessionDecoder)
-//!       │  ring channel: a preallocated circular buffer (crossbeam ArrayQueue),
-//!       │  no allocation per record; a full ring is the backpressure point —
-//!       │  the pipe fills, the runtime drops, the parser counts the sequence gaps
+//! per target: session producer (EventSession → SessionDecoder)
+//!       │  post into the shard's dotnet-gc block input (bounded ring; a full buffer is
+//!       │  the backpressure point — the pipe fills, the runtime drops, the parser
+//!       │  counts the sequence gaps)
 //!       ▼
-//! pipeline actor, one per shard (D14): drain → transform (pure mapping) → sink
-//!       │  the sink is the single writer of its shard's store files
-//!       ▲
-//! process source: OS memory of every target on a 1 s cadence (thread count every 60th)
+//! dotnet-gc block, one per shard (D14): session telemetry/counters → points,
+//!       target and session lifecycle → events, attach → registration
+//!       │  link_to (completion propagates) ──┐
+//!                                          ▼
+//! process block, one per shard ───►  store block, one per shard: batching + the
+//!       │                            single writer of the shard's store files
+//!       └ samples OS memory of its targets on its own tick (thread count every 60th)
 //!
 //! main: attach, place targets by stable hash (256 logical shards), tokio driver
 //!       (ctrl-c → flag), graceful detach:
-//!       stop_session → runtime flushes → sources see end of stream → drain, flush, join
+//!       stop_session → runtime flushes → producers end → targets drop → cascade
+//!       completes → store blocks flush and close
 //! ```
 //!
-//! Resource accounting (bounded): per target a 256 KiB parser buffer plus one ring
-//! (`session_ring` × ~150 B ≈ 300 KiB at the default); counter strings are rented from the
-//! EC pool (`wolf-dotnet`); batch and staging buffers keep steady-state capacity. Nothing
-//! in the data path grows with uptime.
+//! Resource accounting (bounded): per target a 256 KiB parser buffer; per shard the two
+//! block buffers (`gc_ring`, `store_ring`); counter strings are rented from the EC
+//! pool (`wolf-dotnet`); batch buffers keep steady-state capacity. Nothing in the data
+//! path grows with uptime.
 
 mod attach;
-mod channel;
+mod blocks;
+mod dataflow;
 mod error;
 mod host;
-mod pipeline;
 mod placement;
-mod record;
-mod sink;
-mod sources;
+mod producers;
+mod stats;
 mod telemetry;
-mod transform;
 
 pub use attach::{Attached, attach, host_name, target_id, telemetry_session_config};
-pub use channel::{Consumer, Producer, Wakeup, channel};
+pub use blocks::dotnet_gc::{DotnetGcBlock, GcAttach, GcIn, TargetFlags};
+pub use blocks::process::{ProcessBlock, ProcessIn, ProcessTarget};
+pub use blocks::store::{RetentionConfig, StoreBlock, StoreConfig, StoreOp};
+pub use dataflow::{
+    Block, BlockHandle, BlockOptions, Handler, Target, action_block, transform_block,
+};
 pub use error::{Error, Result};
 pub use host::{HostConfig, HostReport, run};
-pub use pipeline::{
-    Pipeline, PipelineConfig, PipelineHandle, PipelineStats, PipelineStatsSnapshot, RetentionConfig,
-};
 pub use placement::{LOGICAL_SHARDS, Placement};
-pub use record::{Message, Record};
-pub use sources::process::{ProcessSource, ProcessTarget};
-pub use sources::session::{SessionDecoder, SessionEnd, SessionItem, run_session_source};
-pub use sources::{SourceStats, SourceStatsSnapshot};
+pub use producers::session::{SessionDecoder, SessionEnd, SessionItem, run_session_producer};
+pub use producers::{SessionStats, SessionStatsSnapshot};
+pub use stats::{ShardStats, ShardStatsSnapshot};
 pub use telemetry::SelfTelemetry;
-pub use transform::TargetFlags;

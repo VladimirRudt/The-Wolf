@@ -53,8 +53,8 @@ fn main() -> ExitCode {
                 report.sources.events,
                 report.sources.dropped,
                 report.sources.bytes,
-                report.pipelines.points_written,
-                report.pipelines.events_written,
+                report.shards.points_written,
+                report.shards.events_written,
                 report.sample_errors,
             );
             ExitCode::SUCCESS
@@ -71,8 +71,8 @@ fn usage() -> ExitCode {
         "mrwolf {} — attach to running .NET processes and store their telemetry\n\
          usage: mrwolf [--db <dir>] [--shards <n>] <pid>...\n\
          \n\
-         --db <dir>    store directory with one shard-NN/ per pipeline (default: wolf.db)\n\
-         --shards <n>  pipeline threads / physical shards (default: 4)\n\
+         --db <dir>    store directory with one shard-NN/ per shard (default: wolf.db)\n\
+         --shards <n>  physical shards, one dotnet-gc + process → store block group each (default: 4)\n\
          <pid>...      pids of .NET processes to watch; stop with ctrl-c",
         env!("CARGO_PKG_VERSION")
     );

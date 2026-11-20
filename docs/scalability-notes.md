@@ -1,4 +1,4 @@
-# Scalability notes — sharded pipeline architecture
+# Scalability notes — sharded dataflow architecture
 
 > Working notes from the 2026 scalability redesign of `wolf-host`/`wolf-storage`. The
 > normative design lives in `docs/architecture.md` (§4.1, D13, D14); this file collects
@@ -43,7 +43,7 @@ coordination-free, and all ordering requirements are per-series (hence per-targe
 ## What we built (D14)
 
 ```
-readers/sampler  →  bounded ring channels  →  pipeline[shard] = transform + sink
+producers  →  bounded block input buffers  →  per shard: mapper block → writer block
                                                  └ single writer of shard-NN/ files
 
 <db-dir>/shard-00/
@@ -52,8 +52,8 @@ readers/sampler  →  bounded ring channels  →  pipeline[shard] = transform + 
   seg-YYYY-MM-DD.duckdb  — raw points of one UTC day
 ```
 
-1. **Sharded pipelines** — N pipeline threads (default 4), each owning its targets
-   exclusively; zero shared mutable state between pipelines.
+1. **Sharded block pairs** — N mapper → writer pairs (default 4), each owning its
+   targets exclusively; zero shared mutable state between shards.
 2. **One store directory per shard**, one DuckDB connection, ATTACHed segment catalogs
    (`appender_to_catalog_and_db` for writes).
 3. **Day-segment files + drop-file retention** — retention downsamples a sealed day into
@@ -65,38 +65,45 @@ readers/sampler  →  bounded ring channels  →  pipeline[shard] = transform + 
    placement, you never reshard data.
 5. **QueryStore** — read-only union over all shard files; the surface for CLI/MCP/TUI.
 
-Actor names follow streaming vocabulary (Vector-style): **sources** (session per target,
-process sampler) → **channels** → **pipeline** (transform → sink).
+Blocks follow TPL Dataflow semantics (D15): each block owns one bounded input buffer and
+a handler; blocks wire with `link_to`, and dropping the last `Target` clone of a block's
+input completes it — completion cascades downstream, so graceful shutdown falls out of
+Drop. Posting to a completed/faulted block is declined. The control plane (`Attach`,
+`RegisterSelf`, `SessionStarted`) rides the graph as records; target slots are assigned
+per shard in attach order. The graph's shape lives only in the wiring (`host.rs`).
+Concrete blocks: per shard a mapper block → writer block link, fed by plain producer
+threads (session per target, process sampler) posting into the mapper's input buffer.
 
 ## High-load scenarios and the mechanism that answers each
 
 | Scenario | First bottleneck | Mechanism |
 |---|---|---|
-| Many targets, one host | CPU on parse/mapping | More pipelines (shards); mapping is pure and parallel per target |
+| Many targets, one host | CPU on parse/mapping | More shards; mapping is pure and parallel per target |
 | One host not enough | — | Target→host hash sharding, vmagent-style; `target_id` needs no protocol change |
 | Storage slower than ingestion | DuckDB write latency | *(deferred)* durable spool/WAL + tiered load shedding; drop-file retention already removes the DELETE contention |
-| Burst from one target (GC storm) | one source's ring | Per-shard isolation: a hot target saturates one pipeline, others unaffected |
+| Burst from one target (GC storm) | one source's ring | Per-shard isolation: a hot target saturates one shard, others unaffected |
 
 ## Deferred / open
 
-- **Durable spool (WAL)** between sources and pipelines: per-shard segment files, ack
-  after sink flush, replay on restart; tiered load shedding when full (gen0 summaries and
+- **Durable spool (WAL)** between producers and blocks: per-shard segment files, ack
+  after writer flush, replay on restart; tiered load shedding when full (gen0 summaries and
   counters first, lifecycle events last). Listed in roadmap Phase 5.
 - **Live cross-shard reads while the host runs**: DuckDB allows one writer *or* many
   readers per file. Today `QueryStore` works after the host stops (or on a copy). The MCP
-  server (P4) will need to broker live reads — e.g. query-through-pipeline or a read
+  server (P4) will need to broker live reads — e.g. query-through-block or a read
   replica handoff.
 - **Multi-host placement**: the 256-bucket map is ready for `bucket_range → host`
   assignment with replication + store-side dedup (`(series_id, ts_utc_ns)` is a natural
   idempotency key).
 - Storage-engine swap (ClickHouse/VictoriaMetrics) stays possible via the `Storage`
-  trait (D7); `DuckDbStore` remains as the simple single-file backend.
+  trait (D7); the original single-file `DuckDbStore` was removed once `ShardStore`
+  replaced it.
 
 ## Verification state
 
 - `wolf-storage`: shard segmentation, unioned reads, drop-file retention with longterm
   aggregate check, reopen persistence, cross-shard `QueryStore` — all tested
   (`tests/shard_store.rs`, `shard.rs` unit tests).
-- `wolf-host`: pipeline mapping/lifecycle/self-telemetry tests (`tests/pipeline.rs`),
-  placement stability/spread unit tests (`placement.rs`).
+- `wolf-host`: graph-level tests over an in-memory store (`tests/graph.rs`), block
+  semantics unit tests (`dataflow.rs`), placement stability/spread (`placement.rs`).
 - Full gate green: `cargo fmt --check`, `clippy -D warnings`, `cargo test --workspace`.
