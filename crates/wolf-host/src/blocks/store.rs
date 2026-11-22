@@ -3,12 +3,14 @@
 //! the flush and retention cadences. The block thread, channels and completion come from
 //! `dataflow`; this struct is workflow only.
 
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
-use wolf_contract::{Event, Point, SeriesDescriptor, TargetId, Timestamp};
-use wolf_storage::Storage;
+use wolf_contract::{Event, Point, SeriesDescriptor, SeriesId, TargetId, Timestamp};
+use wolf_storage::{Storage, TargetInfo};
 
 use crate::dataflow::Handler;
 use crate::stats::ShardStats;
@@ -26,6 +28,63 @@ pub enum StoreOp {
     },
     Point(Point),
     Event(Event),
+    /// A read the store block runs against its own store: the block is the single owner
+    /// of the shard's files, so it is the only safe reader while the host runs (the
+    /// `mrwolf watch` storage panel posts one of these to every shard and merges the
+    /// replies). Reads see flushed batches only, not the block's pending buffers.
+    Query(Query),
+}
+
+/// One storage read plus the channel for its answer.
+#[derive(Debug)]
+pub struct Query {
+    pub op: QueryOp,
+    pub reply: Sender<QueryOutcome>,
+}
+
+/// The reads the watch view can ask a shard for.
+#[derive(Debug, Clone)]
+pub enum QueryOp {
+    /// Every target registered in the shard.
+    Targets,
+    /// Events of one target in the range.
+    Events {
+        target: TargetId,
+        range: Range<Timestamp>,
+    },
+    /// Points of one series in the range.
+    Points {
+        series: SeriesId,
+        range: Range<Timestamp>,
+    },
+}
+
+/// One shard's answer; errors travel as text — the view only displays them.
+pub type QueryOutcome = Result<QueryReply, String>;
+
+/// The data side of a [`QueryOutcome`].
+#[derive(Debug)]
+pub enum QueryReply {
+    Targets(Vec<TargetInfo>),
+    Events(Vec<Event>),
+    Points(Vec<Point>),
+}
+
+impl Query {
+    /// Runs the read against the block's store and sends the outcome. Called on the
+    /// store block's thread, between data ops (FIFO): a query never reorders writes.
+    fn answer(self, store: &impl Storage) {
+        let outcome = match &self.op {
+            QueryOp::Targets => store.targets().map(QueryReply::Targets),
+            QueryOp::Events { target, range } => {
+                store.events(target, range.clone()).map(QueryReply::Events)
+            }
+            QueryOp::Points { series, range } => {
+                store.points(*series, range.clone()).map(QueryReply::Points)
+            }
+        };
+        let _ = self.reply.send(outcome.map_err(|error| error.to_string()));
+    }
 }
 
 /// Cadence configuration for the store block.
@@ -56,6 +115,9 @@ pub struct StoreBlock<S: Storage> {
     config: StoreConfig,
     next_flush: Instant,
     next_retain: Option<Instant>,
+    /// The `mrwolf watch` tap (P1-9): sees every op this block handles. The store block
+    /// is the graph's fan-in point, so one tap covers all of a target's records.
+    watch: Option<Arc<crate::watch::Watch>>,
     /// The first fatal (storage) error; set once, read by the host after completion.
     error: Option<crate::Error>,
 }
@@ -70,8 +132,15 @@ impl<S: Storage> StoreBlock<S> {
             config,
             next_flush: Instant::now() + config.flush_interval,
             next_retain: config.retention.map(|r| Instant::now() + r.every),
+            watch: None,
             error: None,
         }
+    }
+
+    /// Sets the watch tap (none by default, so tests and non-watch runs pay nothing).
+    pub fn with_watch(mut self, watch: Option<Arc<crate::watch::Watch>>) -> Self {
+        self.watch = watch;
+        self
     }
 
     pub fn store(&self) -> &S {
@@ -113,6 +182,9 @@ impl<S: Storage> StoreBlock<S> {
 
 impl<S: Storage> Handler<StoreOp, ()> for StoreBlock<S> {
     fn handle(&mut self, input: StoreOp, _emit: &mut dyn FnMut(())) {
+        if let Some(watch) = &self.watch {
+            watch.tap(&input);
+        }
         match input {
             StoreOp::Register {
                 target,
@@ -129,6 +201,7 @@ impl<S: Storage> Handler<StoreOp, ()> for StoreBlock<S> {
             }
             StoreOp::Point(point) => self.points.push(point),
             StoreOp::Event(event) => self.events.push(event),
+            StoreOp::Query(query) => query.answer(&self.store),
         }
     }
 

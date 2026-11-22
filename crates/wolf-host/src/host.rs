@@ -30,6 +30,7 @@ use crate::producers::session::run_session_producer;
 use crate::producers::{SessionStats, SessionStatsSnapshot};
 use crate::stats::{ShardStats, ShardStatsSnapshot};
 use crate::telemetry::SelfTelemetry;
+use crate::watch::Watch;
 use crate::{Error, Result};
 
 /// How long raw points stay at full resolution before retention downsamples them and
@@ -60,6 +61,9 @@ pub struct HostConfig {
     pub store_ring: usize,
     /// Full-resolution window and how often each shard's store block runs retention.
     pub retention: Option<RetentionConfig>,
+    /// Render the live terminal view (`mrwolf watch`, P1-9) instead of the console
+    /// report: charts, a GC log, and a storage-query panel over the tapped store blocks.
+    pub watch: bool,
 }
 
 impl Default for HostConfig {
@@ -78,6 +82,7 @@ impl Default for HostConfig {
                 window: RAW_WINDOW,
                 every: Duration::from_secs(60 * 60),
             }),
+            watch: false,
         }
     }
 }
@@ -125,6 +130,14 @@ pub fn run(config: &HostConfig) -> Result<HostReport> {
     let self_telemetry = SelfTelemetry::new(target_id(std::process::id())?);
     let self_shard = placement.shard_of(self_telemetry.target()) as usize;
 
+    // The watch view (P1-9): a tap on every shard's store block — the graph's fan-in
+    // point, so one tap covers every target — plus a clone of each store input for the
+    // view's storage queries. The host's own self-telemetry target is excluded.
+    let watch = config
+        .watch
+        .then(|| Arc::new(Watch::new().excluding(self_telemetry.target().clone())));
+    let mut store_inputs: Vec<Target<StoreOp>> = Vec::new();
+
     // Build the graph: per shard a dotnet-gc and a process block, both linked into the
     // shard's store block.
     let mut gc_inputs: Vec<Target<GcIn>> = Vec::new();
@@ -151,12 +164,15 @@ pub fn run(config: &HostConfig) -> Result<HostReport> {
         let store = action_block(
             crate::dataflow::BlockOptions::named(format!("wolf-store-{shard:02}"))
                 .capacity(config.store_ring),
-            StoreBlock::new(store, Arc::clone(&stats), store_config),
+            StoreBlock::new(store, Arc::clone(&stats), store_config).with_watch(watch.clone()),
         );
         gc.link_to(store.input());
         process.link_to(store.input());
         if shard as usize == self_shard {
             self_tx = Some(store.input());
+        }
+        if watch.is_some() {
+            store_inputs.push(store.input());
         }
         gc_inputs.push(gc.input());
         process_inputs.push(process.input());
@@ -225,11 +241,14 @@ pub fn run(config: &HostConfig) -> Result<HostReport> {
         &shutdown,
         &self_telemetry,
         &self_tx,
+        watch.as_deref(),
+        &store_inputs,
     );
 
     // Producers are done (supervise waits for them). Drop every remaining input target:
     // completion cascades into the store blocks, draining all buffered records.
     drop(self_tx);
+    drop(store_inputs);
     drop(gc_inputs);
     drop(process_inputs);
 
@@ -367,7 +386,10 @@ fn start_target(
 /// The supervision loop: report on cadence, and start shutdown when ctrl-c arrives, when
 /// every target has detached, or when a block died (its error surfaces at join).
 /// Shutdown order matters: producers must be finished before their input targets drop,
-/// so no record is ever left undrained.
+/// so no record is ever left undrained. In watch mode the loop renders the live view
+/// and handles its keys instead of printing the report line; the terminal is restored
+/// when the view drops.
+#[allow(clippy::too_many_arguments)]
 fn supervise(
     config: &HostConfig,
     handles: &[ShardHandle],
@@ -376,13 +398,43 @@ fn supervise(
     shutdown: &Arc<AtomicBool>,
     self_telemetry: &SelfTelemetry,
     self_tx: &Target<StoreOp>,
+    watch: Option<&Watch>,
+    store_inputs: &[Target<StoreOp>],
 ) {
+    /// Frame cadence of the watch view; the report line cadence stays `report_interval`.
+    const FRAME: Duration = Duration::from_millis(500);
+    // Entering the view can fail (no terminal); fall back to the report line then.
+    let mut view = match watch {
+        Some(_) => match crate::watch::view::View::enter() {
+            Ok(view) => Some(view),
+            Err(error) => {
+                eprintln!(
+                    "mrwolf: no terminal for the watch view ({error}); using the report line"
+                );
+                None
+            }
+        },
+        None => None,
+    };
+    let mut view_state = view
+        .as_ref()
+        .map(|_| crate::watch::view::ViewState::default());
+    let mut next_frame = Instant::now();
     let mut next_report = Instant::now() + config.report_interval;
     let mut stopping = false;
     loop {
         let now = Instant::now();
+        if let (Some(view), Some(view_state), Some(watch)) =
+            (view.as_mut(), view_state.as_mut(), watch)
+        {
+            view_state.handle_input(watch, store_inputs, shutdown);
+            if now >= next_frame {
+                view.draw(watch, view_state);
+                next_frame = now + FRAME;
+            }
+        }
         if now >= next_report {
-            report(ctxs, handles, self_telemetry, self_tx);
+            report(ctxs, handles, self_telemetry, self_tx, view.is_none());
             next_report = now + config.report_interval;
         }
         let block_died = handles
@@ -396,7 +448,10 @@ fn supervise(
                     .all(|ctx| ctx.flags.detached.load(Ordering::Relaxed)))
         {
             stopping = true;
-            println!("mrwolf: stopping sessions...");
+            if view.is_none() {
+                // In watch mode the line would land on the alternate screen and vanish.
+                println!("mrwolf: stopping sessions...");
+            }
             stop_sessions(ctxs, handle);
         }
         if stopping && ctxs.iter().all(|ctx| ctx.source.is_finished()) {
@@ -406,12 +461,14 @@ fn supervise(
     }
 }
 
-/// One report tick: self-telemetry into the store block, then the console line.
+/// One report tick: self-telemetry into the store block, then — unless the watch view
+/// owns the screen — the console line.
 fn report(
     ctxs: &[TargetCtx],
     handles: &[ShardHandle],
     self_telemetry: &SelfTelemetry,
     self_tx: &Target<StoreOp>,
+    console: bool,
 ) {
     let totals = SessionStatsSnapshot::total(ctxs.iter().map(|ctx| ctx.stats.snapshot()));
     let rss = wolf_process::sample(std::process::id())
@@ -421,6 +478,9 @@ fn report(
         let _ = self_tx.post(StoreOp::Point(point));
     }
     let written = ShardStatsSnapshot::total(handles.iter().map(|handle| handle.stats.snapshot()));
+    if !console {
+        return;
+    }
     println!(
         "mrwolf: targets={} events={} dropped={} bytes={} written={}p/{}e skipped={}",
         ctxs.iter()

@@ -35,7 +35,7 @@ Phased plan. Each task is sized to be implemented in one focused session (human 
 | ✅ P1-6 | `wolf-process`: OS memory metrics (Linux `/proc` + cgroup; Windows `GetProcessMemoryInfo`) | Values match `top`/`ps` / Task Manager |
 | ✅ P1-7 | `wolf-storage`: storage trait; DuckDB impl for points, events, targets; batch inserts; range queries; retention job (downsample 1 s → 1 min; see `architecture.md` §4.1) | Insert 1M points < few seconds; range query tests; retention test |
 | P1-8 | `wolf-host`: run collectors per target, route to storage, self-telemetry, graceful detach | Runs for 1 h against `SteadyAllocator` with stable memory and no drops |
-| P1-9 | `wolf watch <pid>`: terminal view (table or simple TUI chart) of gen sizes, heap total, process memory, GC events | Developer can watch `LeakyOrderService` grow live |
+| ✅ P1-9 | `wolf watch <pid>`: terminal view (table or simple TUI chart) of gen sizes, heap total, process memory, GC events | Developer can watch `LeakyOrderService` grow live |
 
 **Milestone 1:** attach to a running app with no restart and watch its memory live; data persists in DuckDB.
 

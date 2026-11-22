@@ -28,6 +28,13 @@
 //!       completes → store blocks flush and close
 //! ```
 //!
+//! `mrwolf watch` (P1-9) runs the same graph with a live terminal view: the store blocks
+//! get a [`Watch`] tap (they are the fan-in point, so one tap covers every target), and
+//! the supervision loop renders charts and panels instead of printing the report line.
+//! Storage queries from the view go back through the store blocks (`StoreOp::Query`) —
+//! the store cannot be read while the host writes it, so the blocks are the only safe
+//! readers. Called without pids, `watch` first shows a picker for targets and shard count.
+//!
 //! Resource accounting (bounded): per target a 256 KiB parser buffer; per shard the two
 //! block buffers (`gc_ring`, `store_ring`); counter strings are rented from the EC
 //! pool (`wolf-dotnet`); batch buffers keep steady-state capacity. Nothing in the data
@@ -42,6 +49,7 @@ mod placement;
 mod producers;
 mod stats;
 mod telemetry;
+mod watch;
 
 pub use attach::{Attached, attach, host_name, target_id, telemetry_session_config};
 pub use blocks::dotnet_gc::{DotnetGcBlock, GcAttach, GcIn, TargetFlags};
@@ -57,3 +65,4 @@ pub use producers::session::{SessionDecoder, SessionEnd, SessionItem, run_sessio
 pub use producers::{SessionStats, SessionStatsSnapshot};
 pub use stats::{ShardStats, ShardStatsSnapshot};
 pub use telemetry::SelfTelemetry;
+pub use watch::{PickerResult, Watch, pick_targets};

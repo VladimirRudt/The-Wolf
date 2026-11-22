@@ -18,8 +18,10 @@ snapshots (`.briefcase`), analysis, rules and the MCP server are on the
 # Terminal 1: something to watch
 dotnet run --project samples/LeakyOrderService    # prints its PID
 
-# Terminal 2: collect
+# Terminal 2: collect (add `watch` for a live view of heap, memory and GCs)
 cargo run -p wolf-host -- 4812                    # ctrl-c to stop
+cargo run -p wolf-host -- watch 4812              # same, with the live terminal view
+cargo run -p wolf-host -- watch                   # pick targets and shards interactively
 ```
 
 Telemetry lands in `wolf.db/shard-NN/` (`meta.duckdb`, one `seg-YYYY-MM-DD.duckdb` per
